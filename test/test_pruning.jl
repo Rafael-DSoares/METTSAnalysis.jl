@@ -2,38 +2,6 @@ using Test
 using TOML
 using Dumper
 
-# ---- Helpers ----------------------------------------------------------------
-
-# Simulates keyboard input by using a temporary file stream
-function simulate_input(f::Function, input_str::String)
-    tmp = tempname()
-    write(tmp, input_str)
-    open(tmp, "r") do io
-        redirect_stdin(f, io)
-    end
-    rm(tmp, force=true)
-end
-
-function make_1d_file(filename, tags, data_dict)
-    dfile = DumpFile(filename)
-    for tag in tags
-        for val in data_dict[tag]
-            dump!(dfile, tag, val)
-        end
-    end
-end
-
-function make_2d_file(filename, tags, data_dict, beta_collapse, betas)
-    dfile = DumpFile(filename)
-    write_data!(dfile, "beta_collapse", beta_collapse)
-    write_data!(dfile, "betas", betas)
-    for tag in tags
-        for row in eachrow(data_dict[tag])
-            dump!(dfile, tag, collect(row))
-        end
-    end
-end
-
 
 # Simulates keyboard input by using a temporary file stream
 function simulate_input(f::Function, input_str::String)

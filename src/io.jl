@@ -1,6 +1,3 @@
-
-
-
 function load_metts_file_interval(filename::AbstractString, observables::Vector{String}; 
                                  toml_name::Union{String, Nothing}=nothing, 
                                  not_use_prune::Bool=false)
@@ -9,22 +6,24 @@ function load_metts_file_interval(filename::AbstractString, observables::Vector{
 
     # 1. Read Metadata
     beta_collapse = read_data(dfile, "beta_collapse")
-    betas         = vec(read_data(dfile, "betas"))   
+    betas         = vec(read_data(dfile, "betas"))
     log_norm_mat  = read_data(dfile, "log_norm")
     n_samples_total = size(log_norm_mat, 1)
 
     # 2. Determine Global Pruning (Check TOML once)
     toml_file = toml_name === nothing ? splitext(filename)[1] * "_pruning.toml" : joinpath(dirname(filename), toml_name)
     start_idx, end_idx = 1, n_samples_total
-    
-    if !not_use_prune && isfile(toml_file)
-        prune_dict = TOML.parsefile(toml_file)
-        start_idx = get(prune_dict, "start", 1)
-        end_idx   = get(prune_dict, "end", n_samples_total)
-    end
 
-    # 3. Read all observables into memory (One loop over tags)
-    # We store them in a temp dict to zip them later
+    if !not_use_prune
+        if isfile(toml_file)
+            prune_dict = TOML.parsefile(toml_file)
+            start_idx = get(prune_dict, "start", 1)
+            end_idx   = get(prune_dict, "end", n_samples_total)
+        else
+            @warn "Pruning file not found at $toml_file. Loading full range."
+        end
+    end
+    
     temp_storage = Dict{Symbol, Matrix{Float64}}()
     for obs in observables
         mat = read_data(dfile, obs)
@@ -35,21 +34,16 @@ function load_metts_file_interval(filename::AbstractString, observables::Vector{
     end
     temp_storage[:log_norm] = Float64.(log_norm_mat)
 
-    # 4. Prepare the schema for the NamedTuple
     keys_tuple = Tuple(keys(temp_storage))
 
-    # 5. Build the measurements vector (Slicing happens here)
     range = start_idx:end_idx
     measurements = map(range) do i
-        # For each sample index i, grab the i-th row of every matrix in storage
         vals = Tuple(temp_storage[k][i, :] for k in keys_tuple)
         return NamedTuple{keys_tuple}(vals)
     end
 
     return beta_collapse, betas, measurements
 end
-
-
 
 function load_metts_file(filename::AbstractString, observables::Vector{String}; 
                          toml_name::Union{String, Nothing}=nothing, 
@@ -65,12 +59,16 @@ function load_metts_file(filename::AbstractString, observables::Vector{String};
     toml_file = toml_name === nothing ? splitext(filename)[1] * "_pruning.toml" : joinpath(dirname(filename), toml_name)
     start_idx, end_idx = 1, n_samples_total
 
-    if !not_use_prune && isfile(toml_file)
-        prune_dict = TOML.parsefile(toml_file)
-        start_idx = get(prune_dict, "start", 1)
-        end_idx   = get(prune_dict, "end", n_samples_total)
+    if !not_use_prune
+        if isfile(toml_file)
+            prune_dict = TOML.parsefile(toml_file)
+            start_idx = get(prune_dict, "start", 1)
+            end_idx   = get(prune_dict, "end", n_samples_total)
+        else
+            @warn "Pruning file not found at $toml_file. Loading full range."
+        end
     end
-
+    
     # 2. Read all requested tags once
     temp_storage = Dict{Symbol, Vector{Float64}}()
     for obs in observables
