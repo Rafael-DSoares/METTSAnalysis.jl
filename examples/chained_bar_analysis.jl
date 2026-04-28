@@ -43,14 +43,14 @@ end
 
 filenames = length(ARGS) > 0 ? ARGS : error("usage: julia chained_bar_analysis.jl file1.h5 file2.h5 ...")
 
-data = [load_metts_file(f) for f in filenames]
+data = [load_metts_file(f, observables) for f in filenames]
 
-# Sort by beta_collapse ascending
-sort!(data; by = d -> d[1])
+sort!(data; by = first)
 
-beta_collapses   = [d[1] for d in data]
-all_betas        = [d[2] for d in data]
-all_measurements = [d[3] for d in data]
+beta_collapses   = getindex.(data, 1)
+all_betas        = getindex.(data, 2)
+all_measurements = getindex.(data, 3)
+
 
 println("Loaded $(length(filenames)) files:")
 for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
