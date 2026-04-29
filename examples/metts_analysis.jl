@@ -17,12 +17,12 @@ let
     beta_collapses = getindex.(data, 1)
     all_measurements = getindex.(data, 2)
 
+    results = average_observable_single.(all_measurements; bootstrap=true, n_bootstrap=n_bootstrap) ## the dot . is crucial for it to work
 
-    results = average_observable_single(all_measurements; n_bootstrap=n_bootstrap)
+    energy_means = [res.energy[1] for res in results]   
+    energy_errs  = [res.energy[2] for res in results]
 
-    energy_mean, energy_err = results.energy
-    mag_mean, mag_err = results.magnetization
-
+    
     out = DumpFile("single_metts_result.h5")
     out["energy_mean"] = energy_mean
     out["energy_err"] = energy_err

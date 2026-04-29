@@ -23,162 +23,262 @@ function chained_bar(all_measurements, all_betas, beta_collapses)
 
         idx_km1 = findfirst(b -> isapprox(b, β_km1; atol=1e-8), betas_k)
         idx_k   = findfirst(b -> isapprox(b, β_k;   atol=1e-8), betas_k)
-        isnothing(idx_km1) && error("beta_collapses[$(k-1)] = $β_km1 not found in " *
-                                    "betas of state $k — extend the measurement window")
+        
+        isnothing(idx_km1) && error("beta_collapses[$(k-1)] = $β_km1 not found in betas of state $k")
         isnothing(idx_k)   && error("beta_collapses[$k] = $β_k not found in betas of state $k")
 
-        # CHANGED: Use .log_norm instead of ["log_norm"]
-        log_ratios = [2 * (meas_k[i].log_norm[idx_km1] - meas_k[i].log_norm[idx_k])
-                      for i in 1:N_k]
+        log_ratios = [2 * (meas_k[i].log_norm[idx_km1] - meas_k[i].log_norm[idx_k]) for i in 1:N_k]
         delta_f[k - 1] = logsumexp(log_ratios) - log(N_k)
     end
 
     return delta_f, [0.0; cumsum(delta_f)]
 end
 
+@doc raw"""
+    _update_log_denom!(log_denom, U, f, K, Nk)
+
+Computes the log-denominator for the MBAR self-consistency equations. 
+For each sample $i$ from state $k$, we calculate:
+$$\text{log\_denom}_{k,i} = \ln \sum_{j=1}^K N_j \exp(f_j + U_{k,i,j})$$
+
+where:
+- $N_j$ is the number of samples in state $j$[cite: 7].
+- $f_j$ is the current estimate of the reduced free energy for state $j$[cite: 7].
+- $U_{k,i,j}$ is the reduced potential (2 * log_norm) of sample $i$ from state $k$ evaluated at state $j$[cite: 7].
 """
-Refine free energy estimates by iterating the MBAR self-consistency equations.
-"""
-function mbar_free_energies(all_measurements, all_betas, beta_collapses, f_init;
-                            max_iter=500, tol=1e-10)
-    K  = length(beta_collapses)
-    Nk = [length(all_measurements[k]) for k in 1:K]
-    f  = copy(f_init)
-
-    avail_states = [Int[] for _ in 1:K]
-    avail_idx    = [Int[] for _ in 1:K]
-    for k in 1:K, j in 1:K
-        idx = findfirst(b -> isapprox(b, beta_collapses[j]; atol=1e-8), all_betas[k])
-        if !isnothing(idx)
-            push!(avail_states[k], j)
-            push!(avail_idx[k], idx)
-        end
-    end
-
-    for _ in 1:max_iter
-        # CHANGED: Use .log_norm instead of ["log_norm"]
-        log_denom = [[logsumexp([log(Nk[j]) + f[j] +
-                                 2 * all_measurements[k][i].log_norm[avail_idx[k][jj]]
-                                 for (jj, j) in enumerate(avail_states[k])])
-                      for i in 1:Nk[k]]
-                     for k in 1:K]
-
-        f_new = zeros(K)
-        for j in 1:K
-            terms = Float64[]
-            for k in 1:K
-                jj = findfirst(==(j), avail_states[k])
-                isnothing(jj) && continue
-                for i in 1:Nk[k]
-                    # CHANGED: Use .log_norm instead of ["log_norm"]
-                    push!(terms, 2 * all_measurements[k][i].log_norm[avail_idx[k][jj]] -
-                                 log_denom[k][i])
+function _update_log_denom!(log_denom::Vector{Vector{Float64}}, U::Vector{Matrix{Float64}}, f::Vector{Float64}, K::Int, Nk::Vector{Int})
+    for k in 1:K ## Loop over all states
+        for i in 1:Nk[k] ## Loop over all pruned samples
+            # logsumexp trick to prevent overflow
+            m = -Inf
+            for j in 1:K
+                if !isnan(U[k][i, j])
+                    val = log(Nk[j]) + f[j] + U[k][i, j]
+                    if val > m
+                        m = val
+                    end
                 end
             end
-            f_new[j] = isempty(terms) ? f[j] : -logsumexp(terms)
+            
+            sum_exp = 0.0
+            for j in 1:K
+                if !isnan(U[k][i, j])
+                    sum_exp += exp(log(Nk[j]) + f[j] + U[k][i, j] - m)
+                end
+            end
+            log_denom[k][i] = m + log(sum_exp)
         end
-        f_new .-= f_new[1]
-
-        maximum(abs.(f_new .- f)) < tol && return f_new
-        f .= f_new
     end
-    return f
+    return log_denom
+end
+
+@doc raw"""
+    _update_free_energies!(f_new::Vector{Float64}, 
+                           f::Vector{Float64}, 
+                           U::Vector{Matrix{Float64}}, 
+                           log_denom::Vector{Vector{Float64}}, 
+                           K::Int, 
+                           Nk::Vector{Int})
+
+Updates the reduced free energy estimates:
+$$f_j = -\ln \sum_{k=1}^K \sum_{i=1}^{N_k} \exp(U_{k,i,j} - \text{log\_denom}_{k,i})$$
+"""
+function _update_free_energies!(f_new::Vector{Float64}, 
+                                f::Vector{Float64}, 
+                                U::Vector{Matrix{Float64}}, 
+                                log_denom::Vector{Vector{Float64}}, 
+                                K::Int, 
+                                Nk::Vector{Int})
+    for j in 2:K
+        m = -Inf
+        # Find max for log-sum-exp trick
+        for k in 1:K
+            for i in 1:Nk[k]
+                if !isnan(U[k][i, j])
+                    val = U[k][i, j] - log_denom[k][i]
+                    if val > m
+                        m = val
+                    end
+                end
+            end
+        end
+        
+        if m == -Inf
+            f_new[j] = f[j]
+        else
+            sum_exp = 0.0
+            for k in 1:K
+                for i in 1:Nk[k]
+                    if !isnan(U[k][i, j])
+                        sum_exp += exp(U[k][i, j] - log_denom[k][i] - m)
+                    end
+                end
+            end
+            f_new[j] = -(m + log(sum_exp))
+        end
+    end
+    
+    f_new .-= f_new[1] ## the first f is zero otherwise the system is impossible to solve
+    return f_new
 end
 
 """
-MBAR reweighting of an observable using chained BAR free energies.
+Holds the converged state of an MBAR calculation, including the precalculated 
+energy matrices and weights.
 """
-function mbar_reweight_observable(all_measurements, all_betas, beta_collapses,
-                                  free_energies, observable::Union{String, Symbol})
-    # CHANGED: Cast observable to Symbol once outside the loop for speed
-    obs_sym = Symbol(observable)
-    
-    K  = length(beta_collapses)
-    Nk = [length(all_measurements[k]) for k in 1:K]
+struct MBARState{T}
+    measurements::T                       # The raw Vector of NamedTuples
+    all_betas::Vector{Vector{Float64}}    # The beta arrays for each state
+    beta_collapses::Vector{Float64}       # The target beta values
+    K::Int                                # Number of states
+    Nk::Vector{Int}                       # Number of samples per state
+    U::Vector{Matrix{Float64}}            # Pre-calculated energy matrix
+    free_energies::Vector{Float64}        # The converged free energies (f)
+    log_denom::Vector{Vector{Float64}}    # The converged denominators for reweighting
+end
 
-    avail_states = [Int[] for _ in 1:K]
-    avail_idx    = [Int[] for _ in 1:K]
+"""
+    MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-10)
+
+Constructs the MBARState by running the self-consistency equations until convergence.
+"""
+function MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-10)
+
+    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
+
+    K  = length(beta_collapses)
+    Nk = [length(meas) for meas in all_measurements] ###  the number of measurments per each beta_collapse. Length only looks to the outer data. We assume that the data is organized as the function load_metts work.
+    
+    @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
+    @assert length(all_measurements) == K && length(all_betas) == K
+    
+    # 1. Initialize first with chained BAR (this makes MBAR converge faster!)
+    _, f_init = chained_bar(all_measurements, all_betas, beta_collapses)
+    f = copy(f_init)
+    f_new = zeros(K)
+
+    # 2. Pre-calculate the probability matrix U 
+    U = [fill(NaN, Nk[k], K) for k in 1:K]
     for k in 1:K
         for j in 1:K
             idx = findfirst(b -> isapprox(b, beta_collapses[j]; atol=1e-8), all_betas[k])
             if !isnothing(idx)
-                push!(avail_states[k], j)
-                push!(avail_idx[k],    idx)
+                for i in 1:Nk[k]
+                    U[k][i, j] = 2 * all_measurements[k][i].log_norm[idx] ## the factor of 2 comes from the fact that we pass log_norm and not log_norm_square!! (this could be a big source of error if people have this wrong)
+                end
             end
         end
     end
 
-    # CHANGED: Use .log_norm instead of ["log_norm"]
-    log_denom = [[logsumexp([log(Nk[j]) + free_energies[j] +
-                             2 * all_measurements[k][i].log_norm[avail_idx[k][jj]]
-                             for (jj, j) in enumerate(avail_states[k])])
-                  for i in 1:Nk[k]]
-                 for k in 1:K]
+    log_denom = [zeros(Nk[k]) for k in 1:K]
 
-    all_beta_vals = sort(unique(vcat(all_betas...)))
+    ### try to convege the free_energies
 
-    betas_out = Float64[]
-    obs_mean  = Float64[]
-    obs_neff  = Float64[]
+    converged = false
+    for iter in 1:max_iter
+        # Step A: Update log denominators
+        _update_log_denom!(log_denom, U, f, K, Nk)
 
-    for beta in all_beta_vals
-        log_w = Float64[]
-        obs   = Float64[]
+        # Step B: Update free energies
+        _update_free_energies!(f_new, f, U, log_denom, K, Nk)
+        
+        # Check convergence
+        if norm(f_new .- f) < tol
+            converged = true
+            break
+        end
+        f .= f_new
+    end
+    
+    !converged && @warn "MBAR did not converge within $max_iter iterations."
 
-        for k in 1:K
-            beta_idx = findfirst(b -> isapprox(b, beta; atol=1e-8), all_betas[k])
-            isnothing(beta_idx) && continue
-            for i in 1:Nk[k]
-                # CHANGED: Use .log_norm and [obs_sym]
-                ln_num = 2 * all_measurements[k][i].log_norm[beta_idx]
-                push!(log_w, ln_num - log_denom[k][i])
-                push!(obs,   all_measurements[k][i][obs_sym][beta_idx])
+    # 4. Final sync of log_denom to match the fully converged free energies
+    f .= f_new
+    _update_log_denom!(log_denom, U, f, K, Nk)
+
+    return MBARState(all_measurements, all_betas, beta_collapses, K, Nk, U, f, log_denom)
+end
+
+# ==============================================================================
+# REWEIGHTING METHODS
+# ==============================================================================
+
+"""
+    reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
+
+Uses a solved MBARState to cheaply reweight an observable across all unique betas.
+"""
+function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
+    obs_sym = Symbol(observable)
+    
+    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    n_betas = length(all_beta_vals)
+    
+    obs_mean = zeros(n_betas)
+    obs_neff = zeros(n_betas)
+
+    for (b_idx, beta) in enumerate(all_beta_vals)
+        log_w_tmp = Float64[]
+        obs_tmp   = Float64[]
+
+        for k in 1:mbar.K
+            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
+            isnothing(idx) && continue
+            
+            for i in 1:mbar.Nk[k]
+                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
+                
+                # Instantly retrieve the precalculated denominator
+                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
+                push!(obs_tmp, mbar.measurements[k][i][obs_sym][idx])
             end
         end
 
-        isempty(log_w) && continue
-        log_w .-= maximum(log_w)
-        w = exp.(log_w)
-        w ./= sum(w)
-
-        push!(betas_out, beta)
-        push!(obs_mean,  sum(w .* obs))
-        push!(obs_neff,  1 / sum(w .^ 2))
+        if !isempty(log_w_tmp)
+            log_w_tmp .-= maximum(log_w_tmp)
+            w = exp.(log_w_tmp)
+            w ./= sum(w)
+            
+            obs_mean[b_idx] = sum(w .* obs_tmp)
+            obs_neff[b_idx] = 1.0 / sum(w .^ 2)
+        end
     end
 
-    return betas_out, obs_mean, obs_neff
+    return all_beta_vals, obs_mean, obs_neff
 end
 
 """
-Same as mbar_reweight_observable but also returns bootstrap standard errors.
+    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
+
+Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
 """
-function bootstrap_mbar_reweight_observable(all_measurements, all_betas, beta_collapses,
-                                            observable::Union{String, Symbol}; n_bootstrap::Int=500)
-    # Full-data estimate
-    _, f_bar       = chained_bar(all_measurements, all_betas, beta_collapses)
-    free_energies  = mbar_free_energies(all_measurements, all_betas, beta_collapses, f_bar)
-    betas_out, obs_mean, obs_neff =
-        mbar_reweight_observable(all_measurements, all_betas, beta_collapses,
-                                 free_energies, observable)
+function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500)
+    
+    # 1. Full data estimate
+    mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
+    betas_out, obs_mean, obs_neff = reweight_observable(mbar_full, observable)
 
     n_betas  = length(betas_out)
-    K        = length(beta_collapses)
+    K        = mbar_full.K
+    
     boot_obs_mat = zeros(n_bootstrap, n_betas)
     boot_f_mat   = zeros(n_bootstrap, K)
 
+    # 2. Resample and create new MBAR states
     for b in 1:n_bootstrap
-        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]),
-                                              length(all_measurements[k]))]
-                     for k in 1:K]
-        _, f_boot      = chained_bar(meas_boot, all_betas, beta_collapses)
-        f_boot_mbar    = mbar_free_energies(meas_boot, all_betas, beta_collapses, f_boot)
-        _, boot_obs, _ = mbar_reweight_observable(meas_boot, all_betas, beta_collapses,
-                                                   f_boot_mbar, observable)
+        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
+        
+        # We can use fewer max_iterations for bootstraps to save time
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=200)
+        _, boot_obs, _ = reweight_observable(mbar_boot, observable)
+        
         boot_obs_mat[b, :] = boot_obs
-        boot_f_mat[b, :]   = f_boot_mbar
+        boot_f_mat[b, :]   = mbar_boot.free_energies
     end
 
-    obs_err         = [std(boot_obs_mat[:, j]) for j in 1:n_betas]
-    free_energy_err = [std(boot_f_mat[:, j])   for j in 1:K]
-    return betas_out, obs_mean, obs_err, obs_neff, free_energies, free_energy_err
+    obs_err         = vec(std(boot_obs_mat, dims=1))
+    free_energy_err = vec(std(boot_f_mat, dims=1))
+    
+    return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
 end

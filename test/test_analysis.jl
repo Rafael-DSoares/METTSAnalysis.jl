@@ -2,10 +2,8 @@ using Test
 using TOML
 using Random
 using Statistics
-using Test
-using Random
 
-@testset "Analysis: average_observable_single and _boot" begin
+@testset "Analysis: average_observable_single (Standard & Bootstrap)" begin
 
     # --- Setup Data ---
     Random.seed!(42)
@@ -16,35 +14,73 @@ using Random
 
     mock_measurements = map(1:n_samples) do i
         (
-            energy = randn(n_betas) .+ 10.0,  # Mean 10
-            magz   = randn(n_betas) .- 1.0    # Mean -1
+            energy=randn(n_betas) .+ 10.0,
+            magz=randn(n_betas) .- 1.0,
+            log_norm=zeros(n_betas)
         )
     end
 
-    @testset "Standard Analytical (No Bootstrap)" begin
-        # 1. Test the "at beta_collapse" version
+    @testset "Standard Deviation (No Bootstrap)" begin
         results = average_observable_single(mock_measurements, beta_collapse, betas)
-        
+
         @test results isa NamedTuple
         @test isapprox(results.energy[1], 10.0, atol=0.3)
-        # Check that error is roughly sigma/sqrt(N) -> 1.0/sqrt(100) = 0.1
+
+        @test hasproperty(results, :magz)
+        @test hasproperty(results, :energy)
+        @test !hasproperty(results, :lognorm)
+
+
         @test 0.05 < results.energy[2] < 0.15
 
-        # 2. Test the "all data" version (assuming 1D obs per sample)
-        # Let's create a simpler 1D set for this
-        simple_measurements = [(energy=randn()+5.0,) for _ in 1:n_samples]
+
+        simple_measurements = [(energy=randn() + 5.0,) for _ in 1:n_samples]
         res_simple = average_observable_single(simple_measurements)
         @test isapprox(res_simple.energy[1], 5.0, atol=0.2)
     end
 
+
+    @testset "Average values only for specific tags" begin
+
+        results = average_observable_single(mock_measurements, beta_collapse, betas, ["magz"])
+
+        @test results isa NamedTuple
+
+
+        @test hasproperty(results, :magz)
+        @test !hasproperty(results, :energy)
+        @test !hasproperty(results, :log_norm)
+
+
+        @test isapprox(results.magz[1], -1.0, atol=0.3)
+        @test 0.05 < results.magz[2] < 0.15
+
+
+        simple_measurements = [(energy=randn() + 5.0, magz=randn() - 2.0) for _ in 1:n_samples]
+        res_simple = average_observable_single(simple_measurements, ["magz"])
+
+
+        @test hasproperty(res_simple, :magz)
+        @test !hasproperty(res_simple, :energy)
+
+        # Verify the math for the new mock magz data
+        @test isapprox(res_simple.magz[1], -2.0, atol=0.3)
+    end
+
+
     @testset "Bootstrap Version" begin
         tags = ["energy"]
-        results_boot = average_observable_single_boot(
-            mock_measurements, beta_collapse, betas, tags; n_bootstrap=100
+        results_boot = average_observable_single(
+            mock_measurements, beta_collapse, betas, tags; bootstrap=true, n_bootstrap=100
         )
-        
+
+        @test results_boot isa NamedTuple
+
+
+        @test !hasproperty(results_boot, :magz)
         @test hasproperty(results_boot, :energy)
-        @test !hasproperty(results_boot, :magz) # Should only have requested tags
+        @test !hasproperty(results_boot, :lognorm)
+
         @test isapprox(results_boot.energy[1], 10.0, atol=0.3)
         @test results_boot.energy[2] > 0.0 # Error should be positive
     end
@@ -52,6 +88,6 @@ using Random
     @testset "Edge Case: Empty Data" begin
         empty_data = NamedTuple[]
         @test average_observable_single(empty_data) == NamedTuple()
-        @test average_observable_single_boot(empty_data, 0.5, [0.5]) == NamedTuple()
+        @test average_observable_single(empty_data, 0.5, [0.5]; bootstrap=true) == NamedTuple()
     end
 end

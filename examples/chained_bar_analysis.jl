@@ -43,13 +43,21 @@ end
 
 filenames = length(ARGS) > 0 ? ARGS : error("usage: julia chained_bar_analysis.jl file1.h5 file2.h5 ...")
 
-data = [load_metts_file(f, observables) for f in filenames]
+data = [load_metts_file_interval(f, observables) for f in filenames]
 
 sort!(data; by = first)
 
 beta_collapses   = getindex.(data, 1)
 all_betas        = getindex.(data, 2)
 all_measurements = getindex.(data, 3)
+
+
+############# First do normal average ################
+results = average_observable_single.(all_measurements,beta_collapses,all_betas; bootstrap=true, n_bootstrap=n_bootstrap) ## the dot . is crucial for it to work
+
+regular_metts_energy_means = [res.energy[1] for res in results]   
+regular_metts_energy_errs  = [res.energy[2] for res in results]
+
 
 
 println("Loaded $(length(filenames)) files:")

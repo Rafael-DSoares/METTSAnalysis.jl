@@ -6,9 +6,12 @@ using StatsBase
 export prune_analysis, prune, prune_interval, prune_analysis_interval
 include("pruning.jl")
 
-export average_observable_single, average_observable_single_boot
+export average_observable_single
 include("analysis.jl")
 
 export load_metts_file_interval, load_metts_file
 include("io.jl")
+
+export MBARState, reweight_observable, bootstrap_mbar_reweight
+include("mbar.jl")
 end

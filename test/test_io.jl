@@ -32,7 +32,6 @@ end
     energy_full, log_norm_full = make_tmp_metts_file(tmp_file, nmetts, nbetas; add_mag=true)
 
     @testset "No TOML file -> Warns and loads full data" begin
-
         bc, betas, meas = @test_logs (:warn, r"Pruning file not found at .* Loading full range.") load_metts_file_interval(tmp_file, ["energy"])
 
         @test bc == 1.0
@@ -52,7 +51,6 @@ end
         
         mid = nmetts ÷ 2
         @test meas[mid].log_norm ≈ log_norm_full[mid, :]
-
     end
 
     @testset "TOML exists -> Loads pruned data without warnings" begin
@@ -66,6 +64,16 @@ end
         @test meas[1].energy ≈ energy_full[5, :]
         @test meas[end].log_norm ≈ log_norm_full[15, :]
     end
+    
+    @testset "Malformed TOML -> Warns and loads full data" begin
+        open(toml_file, "w") do fl
+            write(fl, "start = 5\n end : 15\n") 
+        end
+
+        bc, betas, meas = @test_logs (:warn, r"Failed to parse pruning file at .* Using full range.") load_metts_file_interval(tmp_file, ["energy"])
+        
+        @test length(meas) == nmetts 
+    end
 
     @testset "not_use_prune = true -> Ignores TOML, no warnings" begin
         bc, betas, meas = @test_logs load_metts_file_interval(tmp_file, ["energy"]; not_use_prune=true)
@@ -73,6 +81,7 @@ end
         @test length(meas) == nmetts
         @test meas[5].energy ≈ energy_full[5, :]
     end
+    
     # Cleanup
     rm(tmp_file, force=true)
     rm(toml_file, force=true)
