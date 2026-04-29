@@ -2,7 +2,7 @@ using Printf
 using TOML
 using HDF5
 using Dumper
-using GLMakie
+using CairoMakie
 
 @doc raw"""
     prune_analysis(data_files::Vector{String}, observable_tags::Vector{String}; toml_name=nothing, axis_kwargs=Dict())
