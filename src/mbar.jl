@@ -142,7 +142,7 @@ end
 
 Constructs the MBARState by running the self-consistency equations until convergence.
 """
-function MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-10)
+function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=500, tol::Float64=1e-10)
 
     @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
 
@@ -183,7 +183,7 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, to
         _update_free_energies!(f_new, f, U, log_denom, K, Nk)
         
         # Check convergence
-        if norm(f_new .- f) < tol
+        if maximum(abs.(f_new .- f)) < tol
             converged = true
             break
         end
@@ -255,7 +255,7 @@ Performs full MBAR bootstrap error analysis by generating bootstrapped MBARState
 function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
                                  observable::Union{String, Symbol}; n_bootstrap::Int=500)
     
-    # 1. Full data estimate
+
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
     betas_out, obs_mean, obs_neff = reweight_observable(mbar_full, observable)
 
@@ -269,7 +269,6 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
     for b in 1:n_bootstrap
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
-        # We can use fewer max_iterations for bootstraps to save time
         mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=200)
         _, boot_obs, _ = reweight_observable(mbar_boot, observable)
         
