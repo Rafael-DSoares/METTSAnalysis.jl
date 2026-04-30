@@ -142,7 +142,7 @@ end
 
 Constructs the MBARState by running the self-consistency equations until convergence.
 """
-function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=500, tol::Float64=1e-10)
+function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=500, tol::Float64=1e-10,alpha::Float64=0.6)
 
     @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
 
@@ -183,6 +183,8 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
 
         # Step B: Update free energies
         _update_free_energies!(f_new, f, U, log_denom, K, Nk)
+
+        f_new .= alpha .* f .+ (1.0 - alpha) .* f_new
 
         last_error = maximum(abs.(f_new .- f))
         # Check convergence
