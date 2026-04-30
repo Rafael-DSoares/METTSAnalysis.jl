@@ -89,7 +89,7 @@ function _update_free_energies!(f_new::Vector{Float64},
                                 log_denom::Vector{Vector{Float64}}, 
                                 K::Int, 
                                 Nk::Vector{Int})
-    for j in 2:K
+    for j in 1:K
         m = -Inf
         # Find max for log-sum-exp trick
         for k in 1:K
@@ -192,7 +192,6 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
     
     !converged && @warn "MBAR did not converge within $max_iter iterations."
 
-    # 4. Final sync of log_denom to match the fully converged free energies
     f .= f_new
     _update_log_denom!(log_denom, U, f, K, Nk)
 
@@ -253,7 +252,7 @@ end
 Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
 """
 function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
-                                 observable::Union{String, Symbol}; n_bootstrap::Int=500)
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000 )
     
 
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
@@ -269,7 +268,7 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
     for b in 1:n_bootstrap
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=200)
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar)
         _, boot_obs, _ = reweight_observable(mbar_boot, observable)
         
         boot_obs_mat[b, :] = boot_obs

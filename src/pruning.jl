@@ -124,7 +124,6 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
             f = Figure()
             kwargs = get(axis_kwargs, tag, (;))
             
-            # FIXED LINE HERE
             ax = Axis(f[1, 1]; title=@sprintf("%s (beta=%.4f)", tag, beta_collapse), 
                       xlabel="MC Step", ylabel=tag, kwargs...)
             
