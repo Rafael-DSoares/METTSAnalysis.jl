@@ -118,7 +118,7 @@ function _update_free_energies!(f_new::Vector{Float64},
         end
     end
     
-    f_new .-= f_new[1] ## the first f is zero otherwise the system is impossible to solve
+    f_new .-= f_new[1]
     return f_new
 end
 
@@ -175,6 +175,8 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
     ### try to convege the free_energies
 
     converged = false
+    last_error = 0.0
+
     for iter in 1:max_iter
         # Step A: Update log denominators
         _update_log_denom!(log_denom, U, f, K, Nk)
@@ -183,7 +185,6 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
         _update_free_energies!(f_new, f, U, log_denom, K, Nk)
 
         last_error = maximum(abs.(f_new .- f))
-        
         # Check convergence
         if last_error < tol
             converged = true
@@ -247,6 +248,7 @@ function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
 
     return all_beta_vals, obs_mean, obs_neff
 end
+
 
 """
     bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
