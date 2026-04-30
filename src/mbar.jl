@@ -143,10 +143,13 @@ end
 Constructs the MBARState by running the self-consistency equations until convergence.
 """
 function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=500, tol::Float64=1e-10,alpha::Float64=0.6)
+    
+    @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
+
     K  = length(beta_collapses)
     Nk = [length(meas) for meas in all_measurements] ###  the number of measurments per each beta_collapse. Length only looks to the outer data. We assume that the data is organized as the function load_metts work.
     
-    @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
+
     @assert length(all_measurements) == K && length(all_betas) == K
     
     # 1. Initialize first with chained BAR (this makes MBAR converge faster!)
@@ -190,10 +193,15 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
         end
         f .= f_new
     end
+    
+    if converged
+        @info "MBAR successfully converged in $max_iter iterations."
+        f .= f_new 
+    else
+        @warn "MBAR did not converge (Last error: $last_error). Falling back to exact Chained BAR (FEP) free energies."
+        f .= f_init # Restore the FEP free energies!
+    end
 
-    !converged && @warn "MBAR did not converge within $max_iter iterations. The last difference is $last_error."
-
-    f .= f_new
     _update_log_denom!(log_denom, U, f, K, Nk)
 
     return MBARState(all_measurements, all_betas, beta_collapses, K, Nk, U, f, log_denom)
