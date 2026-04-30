@@ -181,16 +181,18 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
 
         # Step B: Update free energies
         _update_free_energies!(f_new, f, U, log_denom, K, Nk)
+
+        last_error = maximum(abs.(f_new .- f))
         
         # Check convergence
-        if maximum(abs.(f_new .- f)) < tol
+        if last_error < tol
             converged = true
             break
         end
         f .= f_new
     end
-    
-    !converged && @warn "MBAR did not converge within $max_iter iterations."
+
+    !converged && @warn "MBAR did not converge within $max_iter iterations. The last difference is $last_error."
 
     f .= f_new
     _update_log_denom!(log_denom, U, f, K, Nk)
