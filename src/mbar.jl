@@ -143,9 +143,6 @@ end
 Constructs the MBARState by running the self-consistency equations until convergence.
 """
 function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=500, tol::Float64=1e-10,alpha::Float64=0.6)
-
-    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
-
     K  = length(beta_collapses)
     Nk = [length(meas) for meas in all_measurements] ###  the number of measurments per each beta_collapse. Length only looks to the outer data. We assume that the data is organized as the function load_metts work.
     
@@ -157,14 +154,13 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
     f = copy(f_init)
     f_new = zeros(K)
 
-    # 2. Pre-calculate the probability matrix U 
-    U = [fill(NaN, Nk[k], K) for k in 1:K]
+    U = [fill(-Inf, Nk[k], K) for k in 1:K] # <-- Changed NaN to -Inf
     for k in 1:K
         for j in 1:K
             idx = findfirst(b -> isapprox(b, beta_collapses[j]; atol=1e-8), all_betas[k])
             if !isnothing(idx)
                 for i in 1:Nk[k]
-                    U[k][i, j] = 2 * all_measurements[k][i].log_norm[idx] ## the factor of 2 comes from the fact that we pass log_norm and not log_norm_square!! (this could be a big source of error if people have this wrong)
+                    U[k][i, j] = 2 * all_measurements[k][i].log_norm[idx] 
                 end
             end
         end
@@ -213,6 +209,8 @@ end
 Uses a solved MBARState to cheaply reweight an observable across all unique betas.
 """
 function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
+
+    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
     obs_sym = Symbol(observable)
     
     all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
@@ -260,6 +258,7 @@ Performs full MBAR bootstrap error analysis by generating bootstrapped MBARState
 function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
                                  observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000 )
     
+    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
 
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
     betas_out, obs_mean, obs_neff = reweight_observable(mbar_full, observable)
