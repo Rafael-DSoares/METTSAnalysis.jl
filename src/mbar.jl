@@ -1,3 +1,5 @@
+using Dierckx
+
 function logsumexp(x::AbstractVector{<:Real})
     m = maximum(x)
     return m + log(sum(exp.(x .- m)))
@@ -257,6 +259,7 @@ function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
 end
 
 
+
 """
     bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
 
@@ -308,6 +311,108 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
     for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
         @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
     end
+    
+    return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
+end
+
+
+"""
+    reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
+
+Uses a solved MBARState to cheaply reweight an observable across all unique betas.
+"""
+function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol})
+
+    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
+    obs_sym = Symbol(observable)
+    
+    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    n_betas = length(all_beta_vals)
+    
+    obs_mean = zeros(n_betas)
+    obs_neff = zeros(n_betas)
+
+    for (b_idx, beta) in enumerate(all_beta_vals)
+        log_w_tmp = Float64[]
+        obs_tmp   = Float64[]
+
+        obs_dev   = Float64[]
+
+        energy_tmp   = Float64[]
+
+        for k in 1:mbar.K
+            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
+            isnothing(idx) && continue
+            
+            for i in 1:mbar.Nk[k]
+                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
+                
+                # Instantly retrieve the precalculated denominator
+                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
+                push!(obs_tmp, mbar.measurements[k][i][obs_sym][idx])
+                push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
+
+                spline = Spline1D(all_beta_vals, mbar.measurements[k][i][obs_sym][:], k=3)
+                dy_dx = derivative(spline, beta, 1)
+
+                push!(obs_dev, dy_dx)
+            end
+        end
+
+        if !isempty(log_w_tmp)
+            log_w_tmp .-= maximum(log_w_tmp)
+            w = exp.(log_w_tmp)
+            w ./= sum(w)
+            
+            obseravable_mean = sum(w .* obs_tmp)
+            energy_mean = sum(w .* energy_tmp)
+
+            dev_mean = sum(w .* obs_dev)
+
+            obs_mean[b_idx] = -sum(w.* (obs_tmp .- obseravable_mean)*(energy_tmp .- energy_mean) ) + dev_mean
+
+            obs_neff[b_idx] = 1.0 / sum(w .^ 2)
+        end
+    end
+
+    return all_beta_vals, obs_mean, obs_neff
+end
+
+
+
+"""
+    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
+Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
+"""
+function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, 
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000 )
+    
+    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
+
+    @warn("We assume that there is the energies were saved in an energy array...")
+
+    mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
+    betas_out, obs_mean, obs_neff = reweight_observable_dev(mbar_full, observable)
+
+    n_betas  = length(betas_out)
+    K        = mbar_full.K
+    
+    boot_obs_mat = zeros(n_bootstrap, n_betas)
+    boot_f_mat   = zeros(n_bootstrap, K)
+
+    # 2. Resample and create new MBAR states
+    for b in 1:n_bootstrap
+        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
+        
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar)
+        _, boot_obs, _ = reweight_observable_dev(mbar_boot, observable)
+        
+        boot_obs_mat[b, :] = boot_obs
+        boot_f_mat[b, :]   = mbar_boot.free_energies
+    end
+
+    obs_err         = vec(std(boot_obs_mat, dims=1))
+    free_energy_err = vec(std(boot_f_mat, dims=1))
     
     return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
 end

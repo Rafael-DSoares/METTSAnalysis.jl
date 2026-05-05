@@ -2,6 +2,7 @@ module METTSAnalysis
 using Dumper
 using Statistics
 using StatsBase
+using Dierckx
 
 export prune_analysis, prune, prune_interval, prune_analysis_interval
 include("pruning.jl")
@@ -12,7 +13,7 @@ include("analysis.jl")
 export load_metts_file_interval, load_metts_file
 include("io.jl")
 
-export MBARState, reweight_observable, bootstrap_mbar_reweight
+export MBARState, reweight_observable, bootstrap_mbar_reweight, bootstrap_mbar_reweight_dev
 include("mbar.jl")
 
 
