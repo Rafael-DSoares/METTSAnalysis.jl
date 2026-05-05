@@ -138,7 +138,7 @@ struct MBARState{T}
 end
 
 """
-    MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-10)
+    MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-8)
 
 Constructs the MBARState by running the self-consistency equations until convergence.
 """
@@ -157,7 +157,7 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
     f = copy(f_init)
     f_new = zeros(K)
 
-    U = [fill(-Inf, Nk[k], K) for k in 1:K] # <-- Changed NaN to -Inf
+    U = [fill(-Inf, Nk[k], K) for k in 1:K] #
     for k in 1:K
         for j in 1:K
             idx = findfirst(b -> isapprox(b, beta_collapses[j]; atol=1e-8), all_betas[k])
@@ -196,10 +196,10 @@ function MBARState(all_measurements, all_betas, beta_collapses; max_iter::Int64=
     
     if converged
         @info "MBAR successfully converged in $max_iter iterations."
-        f .= f_new 
+        f .= f_new
     else
         @warn "MBAR did not converge (Last error: $last_error). Falling back to exact Chained BAR (FEP) free energies."
-        f .= f_init # Restore the FEP free energies!
+        f .= f_init
     end
 
     _update_log_denom!(log_denom, U, f, K, Nk)
@@ -218,7 +218,6 @@ Uses a solved MBARState to cheaply reweight an observable across all unique beta
 """
 function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
 
-    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
     obs_sym = Symbol(observable)
     
     all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
@@ -264,11 +263,17 @@ end
 Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
 """
 function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
-                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000 )
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8 )
+
+
+    for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
+        println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
+    end
     
     @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
 
-    mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
+
+    mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
     betas_out, obs_mean, obs_neff = reweight_observable(mbar_full, observable)
 
     n_betas  = length(betas_out)
@@ -281,7 +286,7 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
     for b in 1:n_bootstrap
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar)
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
         _, boot_obs, _ = reweight_observable(mbar_boot, observable)
         
         boot_obs_mat[b, :] = boot_obs
@@ -290,6 +295,19 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
 
     obs_err         = vec(std(boot_obs_mat, dims=1))
     free_energy_err = vec(std(boot_f_mat, dims=1))
+
+
+    println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
+    println("  beta_collapse    F            stderr")
+    for (k, bc) in enumerate(beta_collapses)
+        @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
+    end
+
+    println("\nMBAR energy estimates (bootstrap n=$n_bootstrap):")
+    println("  beta       energy        stderr        N_eff")
+    for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
+        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
+    end
     
     return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
 end

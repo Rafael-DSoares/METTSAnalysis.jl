@@ -81,23 +81,24 @@ end
 Extracts the physical value at beta_collapse from the imaginary time trajectory 
 and computes the average and standard error.
 """
-function average_observable_single(data::AbstractVector{<:NamedTuple}, 
-                                   beta_collapse::Real, 
-                                   betas::AbstractVector{<:Real}, 
-                                   tags::Vector{String}; 
-                                   bootstrap::Bool=false, 
+function average_observable_single(data::AbstractVector{<:NamedTuple},
+                                   beta_collapse::Real,
+                                   betas::AbstractVector{<:Real},
+                                   tags::Vector{String};
+                                   bootstrap::Bool=false,
                                    n_bootstrap::Int=500)
     isempty(data) && return NamedTuple()
     beta_index = argmin(abs.(betas .- beta_collapse))
-    
+
     results_pairs = map(tags) do tag
         sym_tag = Symbol(tag)
+
         series = [m[sym_tag][beta_index] for m in data]
-        
-        obs_mean, obs_err = bootstrap ? 
-            bootstrap_average_observable(series; n_bootstrap=n_bootstrap) : 
+
+        obs_mean, obs_err = bootstrap ?
+            bootstrap_average_observable(series; n_bootstrap=n_bootstrap) :
             standard_average_observable(series)
-            
+
         return sym_tag => (obs_mean, obs_err)
     end
     return NamedTuple(results_pairs)

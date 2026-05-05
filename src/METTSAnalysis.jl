@@ -14,4 +14,8 @@ include("io.jl")
 
 export MBARState, reweight_observable, bootstrap_mbar_reweight
 include("mbar.jl")
+
+
+export pool_states
+include("aux.jl")
 end

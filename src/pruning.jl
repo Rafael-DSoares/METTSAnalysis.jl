@@ -14,15 +14,16 @@ Interactively prune MC data stored in HDF5 files. Plots up to 4 observables at a
 - `axis_kwargs`: A `Dict` mapping tags to `NamedTuple`s for Makie Axis customization.
   Example: `Dict("energy" => (; yscale=log10), "mag" => (; yreversed=true))`
 """
-function prune_analysis(data_files::Vector{String}, observable_tags::Vector{String}; 
+function prune_analysis(data_files::Vector{String}, observable_tags::Vector{String};
                         toml_name::Union{String, Nothing}=nothing,
                         axis_kwargs::Dict{String, <:NamedTuple}=Dict{String, NamedTuple}())
-    
+
     for data_file in data_files
         dfile = DumpFile(data_file)
         println("@ File: " * data_file)
 
         chain_length = 0
+        open_screens = []
 
         for tag in observable_tags
             data = read_data(dfile, tag)
@@ -30,18 +31,19 @@ function prune_analysis(data_files::Vector{String}, observable_tags::Vector{Stri
             if !(ndims(data) == 1 || (ndims(data) == 2 && size(data, 2) == 1))
                 error("Dataset '$tag' must be 1D or Nx1 (got shape $(size(data)))")
             end
-            
+
             data = vec(data)
             chain_length = length(data)
-            
+
             # Create and display plot
             f = Figure()
-            kwargs = get(axis_kwargs, tag, (;)) 
+            kwargs = get(axis_kwargs, tag, (;))
             ax = Axis(f[1, 1]; title="Reviewing: $tag", xlabel="MC Step", ylabel=tag, kwargs...)
-            
+
             scatter!(ax, 1:chain_length, data)
             lines!(ax, 1:chain_length, data)
-            display(f)
+            sc = display(f)
+            push!(open_screens, sc)
         end
 
         println("--- Global Cut for $data_file ---")
@@ -63,6 +65,15 @@ function prune_analysis(data_files::Vector{String}, observable_tags::Vector{Stri
             TOML.print(fl, prune_data)
         end
         println("Pruning written to: ", toml_file)
+        # 3. Close the windows once the TOML file is written
+        for sc in open_screens
+            try
+                close(sc)
+            catch
+                # Silently catch the error in case the user
+                # already manually clicked the 'X' to close the window
+            end
+        end
     end
 end
 
@@ -103,6 +114,10 @@ end
 function prune_analysis_interval(data_files::Vector{String}, observable_tags::Vector{String}; 
                                  toml_name::Union{String, Nothing}=nothing,
                                  axis_kwargs::Dict{String, <:NamedTuple}=Dict{String, NamedTuple}())
+
+
+
+
     
     for data_file in data_files
         dfile = DumpFile(data_file)
@@ -112,6 +127,8 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
         
         println("@ File: " * data_file)
         nmetts = 0
+
+        open_screens = []
 
         for tag in observable_tags
             data = read_data(dfile, tag)
@@ -129,7 +146,8 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
             
             scatter!(ax, 1:nmetts, vals)
             lines!(ax, 1:nmetts, vals)
-            display(f)
+            sc = display(f)
+            push!(open_screens, sc)
         end
 
         println("--- Global Cut for $data_file ---")
@@ -151,6 +169,15 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
             TOML.print(fl, prune_data)
         end
         println("Pruning written to: ", toml_file)
+        # 3. Close the windows once the TOML file is written
+        for sc in open_screens
+            try
+                close(sc)
+            catch
+                # Silently catch the error in case the user
+                # already manually clicked the 'X' to close the window
+            end
+        end
     end
 end
 
