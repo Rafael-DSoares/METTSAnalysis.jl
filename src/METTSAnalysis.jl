@@ -13,7 +13,7 @@ include("analysis.jl")
 export load_metts_file_interval, load_metts_file
 include("io.jl")
 
-export MBARState, reweight_observable, bootstrap_mbar_reweight, bootstrap_mbar_reweight_dev
+export MBARState, reweight_observable, bootstrap_mbar_reweight, bootstrap_mbar_reweight_dev, compute_overlap_matrix
 include("mbar.jl")
 
 

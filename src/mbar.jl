@@ -317,9 +317,43 @@ end
 
 
 """
-    reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
+    precompute_observable_derivatives(mbar::MBARState, observable::Union{String, Symbol})
 
-Uses a solved MBARState to cheaply reweight an observable across all unique betas.
+Fits cubic splines to individual sample trajectories using their strictly native, 
+original beta arrays, and precalculates the 1st derivatives.
+"""
+function precompute_observable_derivatives(mbar::MBARState, observable::Union{String, Symbol})
+    obs_sym = Symbol(observable)
+    precomputed_devs = Vector{Vector{Float64}}[]
+    
+    for k in 1:mbar.K
+        betas_k = mbar.all_betas[k]
+        n_points = length(betas_k)
+        
+        spline_order = min(3, n_points - 1) 
+        
+        devs_k = Vector{Float64}[]
+        for i in 1:mbar.Nk[k]
+            y_vals = mbar.measurements[k][i][obs_sym]
+            
+            if spline_order > 0
+                spline = Spline1D(betas_k, y_vals, k=spline_order)
+
+                push!(devs_k, derivative(spline, betas_k, 1))
+            else
+                push!(devs_k, zeros(n_points))
+            end
+        end
+        push!(precomputed_devs, devs_k)
+    end
+    
+    return precomputed_devs
+end
+
+"""
+    reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol})
+
+Uses a solved MBARState to cheaply reweight an observable and its derivative across all unique betas.
 """
 function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol})
 
@@ -332,13 +366,13 @@ function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symb
     obs_mean = zeros(n_betas)
     obs_neff = zeros(n_betas)
 
+    precomputed_devs = precompute_observable_derivatives(mbar, observable)
+
     for (b_idx, beta) in enumerate(all_beta_vals)
-        log_w_tmp = Float64[]
-        obs_tmp   = Float64[]
-
-        obs_dev   = Float64[]
-
-        energy_tmp   = Float64[]
+        log_w_tmp  = Float64[]
+        obs_tmp    = Float64[]
+        obs_dev    = Float64[]
+        energy_tmp = Float64[]
 
         for k in 1:mbar.K
             idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
@@ -347,15 +381,10 @@ function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symb
             for i in 1:mbar.Nk[k]
                 ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
                 
-                # Instantly retrieve the precalculated denominator
                 push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
                 push!(obs_tmp, mbar.measurements[k][i][obs_sym][idx])
                 push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-
-                spline = Spline1D(all_beta_vals, mbar.measurements[k][i][obs_sym][:], k=3)
-                dy_dx = derivative(spline, beta, 1)
-
-                push!(obs_dev, dy_dx)
+                push!(obs_dev, precomputed_devs[k][i][idx])
             end
         end
 
@@ -364,12 +393,12 @@ function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symb
             w = exp.(log_w_tmp)
             w ./= sum(w)
             
-            obseravable_mean = sum(w .* obs_tmp)
-            energy_mean = sum(w .* energy_tmp)
+            observable_mean = sum(w .* obs_tmp)
+            energy_mean     = sum(w .* energy_tmp)
+            dev_mean        = sum(w .* obs_dev)
 
-            dev_mean = sum(w .* obs_dev)
-
-            obs_mean[b_idx] = -sum(w.* (obs_tmp .- obseravable_mean)*(energy_tmp .- energy_mean) ) + dev_mean
+            # Equation: Fluctuation Term + Mean Derivative
+            obs_mean[b_idx] = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
 
             obs_neff[b_idx] = 1.0 / sum(w .^ 2)
         end
@@ -385,13 +414,17 @@ end
 Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
 """
 function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, 
-                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000 )
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8 )
+
+
+    for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
+        println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
+    end
     
     @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
 
-    @warn("We assume that there is the energies were saved in an energy array...")
 
-    mbar_full = MBARState(all_measurements, all_betas, beta_collapses)
+    mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
     betas_out, obs_mean, obs_neff = reweight_observable_dev(mbar_full, observable)
 
     n_betas  = length(betas_out)
@@ -404,7 +437,7 @@ function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses
     for b in 1:n_bootstrap
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar)
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
         _, boot_obs, _ = reweight_observable_dev(mbar_boot, observable)
         
         boot_obs_mat[b, :] = boot_obs
@@ -413,6 +446,73 @@ function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses
 
     obs_err         = vec(std(boot_obs_mat, dims=1))
     free_energy_err = vec(std(boot_f_mat, dims=1))
+
+
+    println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
+    println("  beta_collapse    F            stderr")
+    for (k, bc) in enumerate(beta_collapses)
+        @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
+    end
+
+    println("\nMBAR energy estimates (bootstrap n=$n_bootstrap):")
+    println("  beta       energy        stderr        N_eff")
+    for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
+        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
+    end
     
     return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
+end
+
+
+@doc raw"""
+    compute_overlap_matrix(mbar::MBARState)
+
+Computes the $K \times K$ MBAR overlap matrix $\mathbb{O}$ using the converged 
+free energies and precomputed log-denominators from an `MBARState`.
+
+The element $\mathbb{O}_{i,j}$ represents the average weight of the samples 
+from state $i$ when evaluated at state $j$. A well-connected MBAR dataset 
+will have significant off-diagonal elements.
+"""
+function compute_overlap_matrix(all_measurements, all_betas, beta_collapses; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
+
+    mbar = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
+
+    K = mbar.K
+    O = zeros(Float64, K, K)
+    
+    for i in 1:K
+        N_i = mbar.Nk[i]
+        if N_i == 0
+            continue # Skip states with no samples to avoid division by zero
+        end
+        
+        for j in 1:K
+            # If the target state j has no samples, its weight contribution is 0
+            if mbar.Nk[j] == 0
+                O[i, j] = 0.0
+                continue
+            end
+            
+            # Base log-weight term for state j: ln(N_j) + f_j
+            base_val = log(mbar.Nk[j]) + mbar.free_energies[j]
+            sum_weights = 0.0
+            
+            for n in 1:N_i
+                u_val = mbar.U[i][n, j]
+                
+                # Check for NaN values just as handled in the MBAR iterations
+                if !isnan(u_val)
+                    # W_{i,n,j} = exp(ln(N_j) + f_j + U_{i,n,j} - log_denom_{i,n})
+                    log_w = base_val + u_val - mbar.log_denom[i][n]
+                    sum_weights += exp(log_w)
+                end
+            end
+            
+            # Average the weights over all samples originally drawn from state i
+            O[i, j] = sum_weights / N_i
+        end
+    end
+    
+    return O
 end
