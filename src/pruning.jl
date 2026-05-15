@@ -4,13 +4,10 @@ using HDF5
 using Dumper
 using CairoMakie
 
-
-
 @doc raw"""
-    prune_analysis_overlaid(data_files::Vector{String}, observable_tags::Vector{String}; toml_name=nothing, axis_kwargs=Dict())
+    prune_analysis(data_files::Vector{String}, observable_tags::Vector{String}; toml_name=nothing, axis_kwargs=Dict())
 
-Plots all seeds on the same axis, calculates an automatic burn-in suggestion using Gelman-Rubin, 
-plots a vertical line at the suggested cut, and prompts the user to verify or adjust per seed.
+Plots all seeds on the same axis and prompts the user to enter a manual burn-in interval per seed.
 """
 function prune_analysis(data_files::Vector{String}, observable_tags::Vector{String};
     toml_name::Union{String,Nothing}=nothing,
@@ -18,17 +15,7 @@ function prune_analysis(data_files::Vector{String}, observable_tags::Vector{Stri
 
     open_screens = []
 
-    # 1. Pre-calculate Automatic Cut Proposal based on the first observable
-    println("\n--- Calculating automatic burn-in suggestion ---")
-    chains_vec = Vector{Vector{Float64}}()
-    for data_file in data_files
-        dfile = DumpFile(data_file)
-        data = vec(read_data(dfile, observable_tags[1]))
-        push!(chains_vec, data)
-    end
-
-
-    # 2. Loop over observables to create the overlaid plots
+    # 1. Loop over observables to create the overlaid plots
     for tag in observable_tags
         f = Figure(size=(1000, 500))
         kwargs = get(axis_kwargs, tag, (;))
@@ -53,7 +40,7 @@ function prune_analysis(data_files::Vector{String}, observable_tags::Vector{Stri
         push!(open_screens, sc)
     end
 
-    # 3. Prompt for individual cuts per file
+    # 2. Prompt for individual cuts per file
     println("\n--- Enter Cuts for Each Seed ---")
     for (i, data_file) in enumerate(data_files)
         dfile = DumpFile(data_file)
@@ -61,9 +48,10 @@ function prune_analysis(data_files::Vector{String}, observable_tags::Vector{Stri
 
         println("\n▶ File $i: $(basename(data_file))")
 
-        print("    Start Index : ")
+        print("    Start Index (default 1): ")
         rd = strip(readline())
-        start_idx = rd != "" ? parse(Int, rd) :
+        # FIX: Added '1' as the default fallback
+        start_idx = rd != "" ? parse(Int, rd) : 1
 
         print("    End Index (default $local_len): ")
         rd = strip(readline())
@@ -123,11 +111,8 @@ function prune(data_files::Vector{String}, observable_tags::Vector{String}; toml
     return data_pruned
 end
 
-
-
-
 @doc raw"""
-    prune_analysis_interval_overlaid(data_files::Vector{String}, observable_tags::Vector{String}; ...)
+    prune_analysis_interval(data_files::Vector{String}, observable_tags::Vector{String}; ...)
 """
 function prune_analysis_interval(data_files::Vector{String}, observable_tags::Vector{String};
     toml_name::Union{String,Nothing}=nothing,
@@ -141,17 +126,7 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
     betas = vec(read_data(dfile_first, "betas"))
     beta_index = argmin(abs.(betas .- beta_collapse))
 
-    # 1. Pre-calculate Automatic Cut Proposal based on the first observable
-    println("\n--- Calculating automatic burn-in suggestion ---")
-    chains_vec = Vector{Vector{Float64}}()
-    for data_file in data_files
-        dfile = DumpFile(data_file)
-        data = read_data(dfile, observable_tags[1])
-        push!(chains_vec, data[:, beta_index])
-    end
-
-
-    # 2. Loop over observables to create the overlaid plots
+    # 1. Loop over observables to create the overlaid plots
     for tag in observable_tags
         f = Figure(size=(1000, 500))
         kwargs = get(axis_kwargs, tag, (;))
@@ -172,16 +147,14 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
             seed_color = bold_colors[mod1(i, length(bold_colors))]
 
             lines!(ax, 1:nmetts, vals, label="Seed $i", color=seed_color, alpha=0.85, linewidth=1.5)
-
         end
-
 
         axislegend(ax, position=:rt)
         sc = display(f)
         push!(open_screens, sc)
     end
 
-    # 3. Prompt for individual cuts per file
+    # 2. Prompt for individual cuts per file
     println("\n--- Enter Cuts for Each Seed ---")
     for (i, data_file) in enumerate(data_files)
         dfile = DumpFile(data_file)
@@ -190,9 +163,10 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
 
         println("\n▶ File $i: $(basename(data_file))")
 
-        print("    Start Index: ")
+        print("    Start Index (default 1): ")
         rd = strip(readline())
-        start_idx = rd != "" ? parse(Int, rd) :
+        # FIX: Added '1' as the default fallback
+        start_idx = rd != "" ? parse(Int, rd) : 1
 
         print("    End Index (default $nmetts): ")
         rd = strip(readline())
@@ -207,7 +181,7 @@ function prune_analysis_interval(data_files::Vector{String}, observable_tags::Ve
         open(toml_file, "w") do fl
             TOML.print(fl, prune_data)
         end
-        println("    ✓ Saved to: ", basename(toml_file))
+        println("✓ Saved to: ", basename(toml_file))
     end
 
     for sc in open_screens
