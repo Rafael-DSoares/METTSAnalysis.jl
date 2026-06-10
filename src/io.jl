@@ -24,7 +24,7 @@ function _get_pruning_indices(filename::AbstractString,
         @warn "Pruning file not found at $toml_file. Loading full range."
     end
     
-    # Guarantee that the parsed indices are valid for our array sizes
+    # Guarantee that the parsed indices are valid for the array sizes
     start_idx = clamp(start_idx, 1, n_samples_total)
     end_idx   = clamp(end_idx, start_idx, n_samples_total)
 
@@ -205,7 +205,6 @@ end
 
 """
     write_product_states_uncorrelated(...)
-
 Reads a single-temperature METTS file, calculates the true autocorrelation time (tau), 
 and writes an uncorrelated subset of the product states to a new `_pd.hdf5` file. 
 Anchors the subset at the most thermalized state.
@@ -297,4 +296,96 @@ function write_product_states_uncorrelated(filename::AbstractString,
     
     println("  ✓ Wrote $n_kept uncorrelated product states to: $(basename(out_filename))\n")
     return out_filename
+end
+
+
+
+"""
+    get_uncorrelated_product_states(...)
+
+Reads a single-temperature METTS file, calculates the true autocorrelation time (tau),
+and returns an uncorrelated subset of the product states along with beta_collapse.
+Anchors the subset at the most thermalized state.
+"""
+function get_uncorrelated_product_states(filename::AbstractString,
+                                         primary_obs::String;
+                                         toml_name::Union{String, Nothing}=nothing,
+                                         not_use_prune::Bool=false,
+                                         max_kept_states::Union{Int, Nothing}=nothing)
+
+    dfile = DumpFile(filename)
+
+    # 1. Read Metadata
+    beta_collapse = read_data(dfile, "beta_collapse")
+
+    # Read the primary observable strictly to calculate tau
+    data_primary = read_data(dfile, primary_obs)
+    if !(ndims(data_primary) == 1 || (ndims(data_primary) == 2 && size(data_primary, 2) == 1))
+         error("Dataset '$primary_obs' is not a 1D array.")
+    end
+
+    vec_primary = vec(data_primary)
+    n_samples_total = length(vec_primary)
+
+    # 2. Determine Global Pruning via Helper
+    start_idx, end_idx = _get_pruning_indices(filename, toml_name, n_samples_total, not_use_prune)
+
+    # 3. Extract the pruned primary observable
+    series = Float64.(vec_primary[start_idx:end_idx])
+    n_pruned = length(series)
+
+    # 4. Calculate Mathematical Tau & Apply Safety Guards
+    if n_pruned < 10
+        @warn "Chain too short ($n_pruned samples). Defaulting to tau = 1."
+        ess = NaN
+        stat_tau = 1
+    else
+        ess = MCMCDiagnosticTools.ess(series)
+
+        if isnan(ess) || ess <= 1.0
+            @warn "ESS is <= 1.0 or NaN for $(basename(filename)). Chain is highly correlated or flat. Defaulting to tau = length."
+            stat_tau = n_pruned
+        else
+            stat_tau = max(1, round(Int, n_pruned / ess))
+        end
+    end
+
+    # 5. Apply User Compute Budget (max_kept_states override)
+    if max_kept_states !== nothing && max_kept_states > 0
+        forced_tau = ceil(Int, n_pruned / max_kept_states)
+        tau = max(stat_tau, forced_tau)
+    else
+        tau = stat_tau
+    end
+
+    # 6. Create the reverse-anchored range
+    thinned_indices = end_idx:-tau:start_idx
+    n_kept = length(thinned_indices)
+
+    # Terminal Report
+    ess_display = isnan(ess) ? "NaN" : string(round(ess, digits=1))
+    println("\n--- Thinning Report for $(basename(filename)) ---")
+    println("  Using Observable : $primary_obs @ beta=$beta_collapse")
+    println("  Pruned Range     : $start_idx to $end_idx ($n_pruned samples)")
+    println("  Effective Samples: $ess_display")
+    println("  Stat Tau         : $stat_tau")
+    if tau > stat_tau
+        println("  Forced Tau       : $tau (Budget limit: $max_kept_states)")
+    end
+    println("  Kept States      : $n_kept (Reversed, anchoring at $end_idx)")
+    println("-------------------------------------------------")
+
+    # 7. Read and extract the specific product states
+    states = read_data(dfile, "product_state")
+
+    if ndims(states) == 1
+        thinned_states = states[thinned_indices]
+    else
+        thinned_states = states[thinned_indices, :]
+    end
+
+    println("  ✓ Extracted $n_kept uncorrelated product states\n")
+
+    # 8. Return the objects instead of writing to disk
+    return thinned_states, beta_collapse
 end

@@ -516,3 +516,124 @@ function compute_overlap_matrix(all_measurements, all_betas, beta_collapses; n_b
     
     return O
 end
+
+
+"""
+    compute_mbar_free_energies(mbar::MBARState)
+
+Computes the reduced (f) and actual (F) free energies across all unique 
+intermediate temperatures (betas) present in the MBAR measurements using 
+the exact MBAR self-consistency formula.
+"""
+function compute_mbar_free_energies(mbar::MBARState)
+    # Collect and sort all unique betas available in the dataset
+    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    n_betas = length(all_beta_vals)
+    
+    f_interp = zeros(n_betas)
+    F_interp = zeros(n_betas)
+
+    for (b_idx, beta) in enumerate(all_beta_vals)
+        log_w_tmp = Float64[]
+
+        for k in 1:mbar.K
+            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
+            isnothing(idx) && continue
+            
+            for i in 1:mbar.Nk[k]
+                # Extract the reduced potential for the sample at the target beta
+                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
+                
+                # Accumulate the weight term: U_{k,i,beta} - log_denom_{k,i}
+                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
+            end
+        end
+
+        if !isempty(log_w_tmp)
+            # f_beta = -ln( \sum exp(U - log_denom) )
+            f_interp[b_idx] = -logsumexp(log_w_tmp)
+        else
+            f_interp[b_idx] = NaN
+        end
+    end
+
+    # Align the reference state to 0.0 to exactly match mbar.free_energies.
+    # We find the index of the first beta collapse and shift the entire array.
+    base_idx = findfirst(b -> isapprox(b, mbar.beta_collapses[1]; atol=1e-8), all_beta_vals)
+    if !isnothing(base_idx)
+        f_interp .-= f_interp[base_idx]
+    else
+        f_interp .-= f_interp[1] # Fallback shift
+    end
+
+    # Compute actual free energies F = f / beta
+    for i in 1:n_betas
+        beta = all_beta_vals[i]
+        if isapprox(beta, 0.0; atol=1e-12)
+            F_interp[i] = NaN # Handle edge case to avoid DivisionByZero
+        else
+            F_interp[i] = f_interp[i] / beta
+        end
+    end
+
+    return all_beta_vals, f_interp, F_interp
+end
+
+"""
+    bootstrap_intermediate_free_energies(all_measurements, all_betas, beta_collapses; kwargs...)
+
+Performs full MBAR bootstrap error analysis on the intermediate free energies.
+Generates `n_bootstrap` resampled datasets, reconverges MBAR for each, and 
+calculates the standard deviation of both the reduced (f) and actual (F) free energies.
+"""
+function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; 
+                                              n_bootstrap::Int=500, max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
+
+    # 1. Compute the reference state using the full, original dataset
+    mbar_full = MBARState(all_measurements, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
+    all_beta_vals, f_mean, F_mean = compute_mbar_free_energies(mbar_full)
+    
+    n_betas = length(all_beta_vals)
+    K       = mbar_full.K
+    
+    # 2. Initialize matrices to hold the bootstrap results
+    boot_f_mat = zeros(n_bootstrap, n_betas)
+    boot_F_mat = zeros(n_bootstrap, n_betas)
+
+    println("Starting bootstrap for intermediate free energies (n=$n_bootstrap)...")
+
+    # 3. Resample and create new MBAR states
+    for b in 1:n_bootstrap
+        # Resample measurements with replacement
+        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
+        
+        # Converge a new MBAR state for this resampled data
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
+        
+        # Compute intermediate free energies for the boot state
+        _, f_boot, F_boot = compute_mbar_free_energies(mbar_boot)
+        
+        boot_f_mat[b, :] = f_boot
+        boot_F_mat[b, :] = F_boot
+    end
+
+    # 4. Compute standard errors across the bootstrap dimension (dims=1)
+    f_err = vec(std(boot_f_mat, dims=1))
+    F_err = vec(std(boot_F_mat, dims=1))
+
+    # 5. Print results gracefully
+    println("\nMBAR Intermediate Free Energies (bootstrap n=$n_bootstrap):")
+    println("  beta        F (actual)    F_stderr      f (reduced)   f_stderr")
+    for i in 1:n_betas
+        # Handle formatting for cases where beta=0 might result in NaN for F
+        if isnan(F_mean[i])
+            @printf("  %8.4f           NaN           NaN  %12.6f  %12.6f\n", 
+                    all_beta_vals[i], f_mean[i], f_err[i])
+        else
+            @printf("  %8.4f  %12.6f  %12.6f  %12.6f  %12.6f\n", 
+                    all_beta_vals[i], F_mean[i], F_err[i], f_mean[i], f_err[i])
+        end
+    end
+    
+    return all_beta_vals, F_mean, F_err
+end
