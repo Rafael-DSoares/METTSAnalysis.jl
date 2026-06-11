@@ -3,7 +3,9 @@
 
 Groups entries that share the same beta_collapse into a single pooled state.
 Multiple files simulated at the same collapse temperature are concatenated
-into one measurement vector. Their `all_betas` arrays must be the same..
+into one measurement vector. Their `all_betas` arrays must be the same.
+
+This is useful to combine different seeds for the same simulation parameters
 
 Returns `(pooled_measurements, pooled_betas, unique_beta_collapses)`.
 """
@@ -41,6 +43,8 @@ Groups entries sharing the same beta_collapse into a single pooled state,
 for the case where each file only contains measurements at its own beta_collapse
 (no log_norm, no cross-beta reweighting).
 
+This is useful to combine different seeds for the same simulation parameters
+
 Returns `(pooled_measurements, unique_beta_collapses)`.
 """
 function pool_states_single(all_measurements, beta_collapses)
@@ -56,4 +60,12 @@ function pool_states_single(all_measurements, beta_collapses)
     end
 
     return pooled_measurements, unique_betas
+end
+
+
+
+
+function logsumexp(x::AbstractVector{<:Real})
+    m = maximum(x)
+    return m + log(sum(exp.(x .- m)))
 end
