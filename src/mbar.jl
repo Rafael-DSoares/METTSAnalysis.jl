@@ -122,15 +122,6 @@ end
 
 """
     _update_log_denom!(log_denom, U, f, K, Nk)
-
-Computes the log-denominator for the MBAR self-consistency equations. 
-For each sample $i$ from state $k$, we calculate:
-$$\text{log\_denom}_{k,i} = \ln \sum_{j=1}^K N_j \exp(f_j + U_{k,i,j})$$
-
-where:
-- $N_j$ is the number of samples in state $j$.
-- $f_j$ is the current estimate of the reduced free energy for state $j$.
-- $U_{k,i,j}$ is the reduced potential (2 * log_norm) of sample $i$ from state $k$ evaluated at state $j$.
 """
 function _update_log_denom!(log_denom::Vector{Vector{Float64}}, U::Vector{Matrix{Float64}}, f::Vector{Float64}, K::Int, Nk::Vector{Int})
     for k in 1:K ## Loop over all states
@@ -165,9 +156,6 @@ _update_free_energies!(f_new::Vector{Float64},
                            log_denom::Vector{Vector{Float64}}, 
                            K::Int, 
                            Nk::Vector{Int})
-
-Updates the reduced free energy estimates:
-$$f_j = -\ln \sum_{k=1}^K \sum_{i=1}^{N_k} \exp(U_{k,i,j} - \text{log\_denom}_{k,i})$$
 """
 function _update_free_energies!(f_new::Vector{Float64}, 
                                 f::Vector{Float64}, 
@@ -466,13 +454,6 @@ end
 
 """
     compute_overlap_matrix(mbar::MBARState)
-
-Computes the $K \times K$ MBAR overlap matrix $\mathbb{O}$ using the converged 
-free energies and precomputed log-denominators from an `MBARState`.
-
-The element $\mathbb{O}_{i,j}$ represents the average weight of the samples 
-from state $i$ when evaluated at state $j$. A well-connected MBAR dataset 
-will have significant off-diagonal elements.
 """
 function compute_overlap_matrix(all_measurements, all_betas, beta_collapses; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
 
@@ -520,7 +501,6 @@ end
 
 """
     compute_mbar_free_energies(mbar::MBARState)
-
 Computes the reduced (f) and actual (F) free energies across all unique 
 intermediate temperatures (betas) present in the MBAR measurements using 
 the exact MBAR self-consistency formula.
@@ -584,7 +564,6 @@ end
 
 """
     bootstrap_intermediate_free_energies(all_measurements, all_betas, beta_collapses; kwargs...)
-
 Performs full MBAR bootstrap error analysis on the intermediate free energies.
 Generates `n_bootstrap` resampled datasets, reconverges MBAR for each, and 
 calculates the standard deviation of both the reduced (f) and actual (F) free energies.
@@ -643,24 +622,23 @@ end
 
 
 
-function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, Symbol}, plaquete_terms::Vector{Union{String, Symbol}}, linear_coefficients::Vector{Float64})
+function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, Symbol}, plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64})
     energy_sym = Symbol(energy)
     
     all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
     n_betas = length(all_beta_vals)
     
     obs_mean = zeros(n_betas)
-
     obs_neff = zeros(n_betas)
 
-    precomputed_devs = precompute_observable_derivatives(mbar, energy_sym)
+    energy_devs = precompute_observable_derivatives(mbar, energy_sym)
 
-    ## first sum over the plaquete terms:
-
+    ## 1. Numerator: Sum over the plaquette terms
     for (p_idx, plaquete) in enumerate(plaquete_terms)
         
         plaquete_sym = Symbol(plaquete)
-        precomputed_devs = precompute_observable_derivatives(mbar, plaquete_sym)
+        # These are local to the plaquette loop now
+        plaquete_devs = precompute_observable_derivatives(mbar, plaquete_sym)
 
         for (b_idx, beta) in enumerate(all_beta_vals)
             log_w_tmp  = Float64[]
@@ -678,7 +656,7 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
                     push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
                     push!(obs_tmp, mbar.measurements[k][i][plaquete_sym][idx])
                     push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                    push!(obs_dev, precomputed_devs[k][i][idx])
+                    push!(obs_dev, plaquete_devs[k][i][idx]) # Using plaquette_devs
                 end
             end
 
@@ -695,9 +673,11 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
                 dP_dbeta = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
 
                 obs_mean[b_idx] += dP_dbeta * linear_coefficients[p_idx] 
+            end
         end
     end
 
+    ## 2. Denominator: Total Energy derivative
     for (b_idx, beta) in enumerate(all_beta_vals)
         log_w_tmp  = Float64[]
         obs_tmp    = Float64[]
@@ -714,7 +694,7 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
                 push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
                 push!(obs_tmp, mbar.measurements[k][i][energy_sym][idx])
                 push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                push!(obs_dev, precomputed_devs[k][i][idx])
+                push!(obs_dev, energy_devs[k][i][idx]) # FIX: using the preserved energy_devs
             end
         end
 
@@ -730,6 +710,7 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
             # Equation: Fluctuation Term + Mean Derivative
             dE_dbeta = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
 
+            # Final assembly: Numerator / (Denominator * beta)
             obs_mean[b_idx] /= dE_dbeta * beta 
 
             obs_neff[b_idx] = 1.0 / sum(w .^ 2)
@@ -740,8 +721,8 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
 end
 
 
-function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy::Union{String, Symbol}, plaquete_terms::Vector{Union{String, Symbol}}, linear_coefficients::Vector{Float64}; 
-    n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8 )
+function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy::Union{String, Symbol}, plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64}; 
+    n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
 
 
     for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
@@ -765,7 +746,7 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
         mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        _, boot_obs, _ = compute_magneto_caloric_effect(mbar_full, energy, plaquete_terms, linear_coefficients)
+        _, boot_obs, _ = compute_magneto_caloric_effect(mbar_boot, energy, plaquete_terms, linear_coefficients)
         
         boot_obs_mat[b, :] = boot_obs
         boot_f_mat[b, :]   = mbar_boot.free_energies
@@ -786,6 +767,6 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
     for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
         @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
     end
-      
+
     return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
 end
