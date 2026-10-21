@@ -37,6 +37,7 @@ function load_metts_file_interval(filename::AbstractString, observables::Vector{
                                  not_use_prune::Bool=false)
 
     dfile = DumpFile(filename)
+    _check_sampling_parameters(filename)
 
     # 1. Read Metadata
     beta_collapse = read_data(dfile, "beta_collapse")
@@ -388,4 +389,108 @@ function get_uncorrelated_product_states(filename::AbstractString,
 
     # 8. Return the objects instead of writing to disk
     return thinned_states, beta_collapse
+end
+
+
+
+# ==============================================================================
+# RUN-PARAMETER CONSISTENCY CHECKS
+# ==============================================================================
+
+"""
+Parameters that must be identical between the thermalization run that sampled a
+product state and the run that re-evolved it; otherwise the samples are not drawn
+from the distribution MBAR reweights them with.
+"""
+const STRICT_SAMPLING_PARAMS = ["L", "W", "J2", "lattice", "maxm", "cutoff"]
+
+"""
+    read_run_parameters(filename; group="params")
+
+Reads the simulation parameters stored as datasets in the HDF5 group `group` of
+`filename` (e.g. `params/maxm`, `params/cutoff`, `params/lattice`).
+Returns an empty Dict if the group is absent.
+
+Store there only settings that must be identical across all files of one analysis;
+per-file values such as `beta_collapse`, the seed or the job id belong at the root.
+"""
+function read_run_parameters(filename::AbstractString; group::AbstractString="params")
+    return h5open(filename, "r") do fid
+        haskey(fid, group) || return Dict{String, Any}()
+        g = fid[group]
+        Dict{String, Any}(k => read(g, k) for k in keys(g))
+    end
+end
+
+_param_equal(a, b) = (a isa Real && b isa Real) ? isapprox(a, b) : isequal(a, b)
+
+function _param_diff(p1::AbstractDict, p2::AbstractDict)
+    return sort([k for k in union(keys(p1), keys(p2))
+                 if !(haskey(p1, k) && haskey(p2, k) && _param_equal(p1[k], p2[k]))])
+end
+
+"""
+    _check_sampling_parameters(filename; group, sampling_group, strict_keys)
+
+Within one file, compares the parameters of the run that produced it (`group`) with
+those of the thermalization run that sampled its product state (`sampling_group`).
+A mismatch in `strict_keys` is an error; other differing shared keys (e.g. `tau`)
+only warn. Does nothing unless both groups are present.
+"""
+function _check_sampling_parameters(filename::AbstractString;
+                                    group::AbstractString="params",
+                                    sampling_group::AbstractString="sampling_params",
+                                    strict_keys::Vector{String}=STRICT_SAMPLING_PARAMS)
+    run_params      = read_run_parameters(filename; group=group)
+    sampling_params = read_run_parameters(filename; group=sampling_group)
+    (isempty(run_params) || isempty(sampling_params)) && return nothing
+
+    for k in intersect(keys(run_params), keys(sampling_params))
+        _param_equal(run_params[k], sampling_params[k]) && continue
+        msg = "$(basename(filename)): '$k' = $(run_params[k]) in '$group' but $(sampling_params[k]) in '$sampling_group'"
+        k in strict_keys ? error(msg * ". The product states were sampled with different settings.") : @warn msg
+    end
+    for k in strict_keys
+        if haskey(run_params, k) != haskey(sampling_params, k)
+            error("$(basename(filename)): '$k' is stored in only one of '$group' and '$sampling_group'.")
+        end
+    end
+    return nothing
+end
+
+"""
+    check_run_parameters(filenames; group="params", sampling_group="sampling_params",
+                         strict_keys=STRICT_SAMPLING_PARAMS)
+
+Guards against mixing files produced with different simulation settings before they
+are pooled or fed to MBAR:
+
+1. The `group` parameters of all files must agree (an error names the first file that
+   differs and the keys involved). Files with and without parameters cannot be mixed.
+2. Within each file, `sampling_group` must agree with `group` on `strict_keys`
+   (see `_check_sampling_parameters`).
+
+Returns the common parameter Dict (empty, with a warning, if no file stores any).
+"""
+function check_run_parameters(filenames::AbstractVector{<:AbstractString};
+                              group::AbstractString="params",
+                              sampling_group::AbstractString="sampling_params",
+                              strict_keys::Vector{String}=STRICT_SAMPLING_PARAMS)
+    isempty(filenames) && return Dict{String, Any}()
+
+    ref = read_run_parameters(filenames[1]; group=group)
+    for f in filenames
+        params = read_run_parameters(f; group=group)
+        diff = _param_diff(ref, params)
+        if !isempty(diff)
+            details = join(["'$k': $(get(ref, k, "missing")) vs $(get(params, k, "missing"))" for k in diff], ", ")
+            error("Run parameters of $(basename(f)) differ from $(basename(filenames[1])): $details")
+        end
+        _check_sampling_parameters(f; group=group, sampling_group=sampling_group, strict_keys=strict_keys)
+    end
+
+    if isempty(ref)
+        @warn "None of the $(length(filenames)) files stores a '$group' group; run parameters cannot be verified."
+    end
+    return ref
 end

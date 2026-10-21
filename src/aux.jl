@@ -1,4 +1,21 @@
 """
+    _unique_approx(sorted_values; atol=1e-8)
+
+Unique values of a sorted vector, treating values within `atol` as equal.
+Plain `unique` keeps float-noise duplicates such as 1.2 and 1.2000000000000002.
+"""
+function _unique_approx(sorted_values; atol::Float64=1e-8)
+    out = eltype(sorted_values)[]
+    for v in sorted_values
+        if isempty(out) || !isapprox(v, out[end]; atol=atol)
+            push!(out, v)
+        end
+    end
+    return out
+end
+
+
+"""
     pool_states(all_measurements, all_betas, beta_collapses)
 
 Groups entries that share the same beta_collapse into a single pooled state.
@@ -12,7 +29,7 @@ Returns `(pooled_measurements, pooled_betas, unique_beta_collapses)`.
 function pool_states(all_measurements, all_betas, beta_collapses)
     @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
 
-    unique_betas = unique(beta_collapses)  # preserves order since input is sorted
+    unique_betas = _unique_approx(beta_collapses)
 
     pooled_measurements = Vector{eltype(all_measurements)}(undef, length(unique_betas))
     pooled_betas        = Vector{eltype(all_betas)}(undef, length(unique_betas))
@@ -50,7 +67,7 @@ Returns `(pooled_measurements, unique_beta_collapses)`.
 function pool_states_single(all_measurements, beta_collapses)
     @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
 
-    unique_betas = unique(beta_collapses)
+    unique_betas = _unique_approx(beta_collapses)
 
     pooled_measurements = Vector{eltype(all_measurements)}(undef, length(unique_betas))
 
