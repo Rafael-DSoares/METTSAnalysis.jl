@@ -1,33 +1,32 @@
-using Statistics
-using Random
-using Printf
+# Plain METTS averages from the thermalization chains (no reweighting).
+#
+# Usage:
+#   julia metts_analysis.jl outfile_therm.seed.1.hdf5 outfile_therm.seed.2.hdf5 ...
+#
+# Files may mix several beta_collapses and seeds. Each file is pruned with its
+# `_pruning.toml` (see prune_and_thin.jl).
+using METTSAnalysis
+using Dumper
 
+filenames = length(ARGS) > 0 ? ARGS : error("usage: julia metts_analysis.jl file1.hdf5 file2.hdf5 ...")
+check_run_parameters(filenames)
 
-let
+data = [load_metts_file(f, ["energy"]) for f in filenames]
+sort!(data; by=first)
+beta_collapses   = getindex.(data, 1)
+all_measurements = getindex.(data, 2)
 
-    filenames = length(ARGS) > 0 ? ARGS : error("usage: julia chained_bar_analysis.jl file1.h5 file2.h5 ...")
+# Keep the seeds of each beta_collapse as separate chains: the error of each chain
+# accounts for its autocorrelation (error_method=:ess) and the seeds are checked
+# for consistency before being combined.
+chains_per_beta, beta_collapses = group_chains_single(all_measurements, beta_collapses)
+results = average_observable_single.(chains_per_beta)
 
-    n_bootstrap = 20
-    tags_to_analyze = ["energy", "magnetization"]
+energy_mean = [res.energy[1] for res in results]
+energy_err  = [res.energy[2] for res in results]
 
-    data = [load_metts_file(f, tags_to_analyze) for f in filenames]
-
-    sort!(data; by=first)
-
-    beta_collapses = getindex.(data, 1)
-    all_measurements = getindex.(data, 2)
-
-    results = average_observable_single.(all_measurements; bootstrap=true, n_bootstrap=n_bootstrap) ## the dot . is crucial for it to work
-
-    energy_means = [res.energy[1] for res in results]   
-    energy_errs  = [res.energy[2] for res in results]
-
-    
-    out = DumpFile("single_metts_result.h5")
-    out["energy_mean"] = energy_mean
-    out["energy_err"] = energy_err
-    out["mag_mean"] = mag_mean
-    out["mag_err"] = mag_err
-    out["beta_collapses"] = beta_collapses
-    println("\nResults written to single_metts_result.h5")
-end
+out = DumpFile("metts_result.h5")
+out["energy_mean"]    = energy_mean
+out["energy_err"]     = energy_err
+out["beta_collapses"] = beta_collapses
+println("Results written to metts_result.h5")

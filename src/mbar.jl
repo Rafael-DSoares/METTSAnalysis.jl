@@ -40,11 +40,15 @@ function _common_betas(all_betas)
 end
 
 """
-    MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-8)
+    MBARState(all_measurements, all_betas, beta_collapses; max_iter=500, tol=1e-10, alpha=0.6, verbose=true)
 
 Constructs the MBARState by running the self-consistency equations until convergence.
+
+Each measurement must carry `log_norm = log‖e^{-βH/2}σ‖` (the norm, not its square) on the
+state's beta grid; the weight of a sample at β is `exp(2 log_norm)`. With `verbose=false`
+a non-converged run is only recorded in `converged` instead of warning.
 """
-function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_collapses::Vector{Float64}; max_iter::Int64=500, tol::Float64=1e-10,alpha::Float64=0.6)
+function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_collapses::Vector{Float64}; max_iter::Int64=500, tol::Float64=1e-10,alpha::Float64=0.6, verbose::Bool=true)
     
     @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
 
@@ -109,8 +113,8 @@ function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_co
     end
 
     if converged
-        @info "MBAR successfully converged in $n_iter iterations."
-    else
+        @debug "MBAR successfully converged in $n_iter iterations."
+    elseif verbose
         # The last iterate is a better estimate than the one-sided chained FEP initial guess
         @warn "MBAR did not converge after $max_iter iterations (last error: $last_error). Using the last iterate."
     end
@@ -237,317 +241,183 @@ end
 # ==============================================================================
 
 """
+    _log_weights(mbar, beta)
+
+Unnormalized MBAR log-weights `ln q_β(x_n) - ln Σ_j N_j e^{f_j} q_j(x_n)` of all samples
+at `beta`, ordered state by state, and the index of `beta` in each state's grid.
+"""
+function _log_weights(mbar::MBARState, beta::Real)
+    idxs = [_beta_index(mbar.all_betas[k], beta) for k in 1:mbar.K]
+    log_w = [2 * mbar.measurements[k][i].log_norm[idxs[k]] - mbar.log_denom[k][i]
+             for k in 1:mbar.K for i in 1:mbar.Nk[k]]
+    return log_w, idxs
+end
+
+"""
+    _weights(mbar, beta)
+
+Normalized MBAR weights at `beta`, the grid indices (see `_log_weights`) and the Kish
+effective sample size `1/Σw²`.
+"""
+function _weights(mbar::MBARState, beta::Real)
+    log_w, idxs = _log_weights(mbar, beta)
+    w = exp.(log_w .- maximum(log_w))
+    w ./= sum(w)
+    return w, idxs, 1.0 / sum(w .^ 2)
+end
+
+"""Values of observable `sym` of every sample at the grid indices `idxs`, in the order of the weights."""
+_values(measurements, sym::Symbol, idxs) =
+    [measurements[k][i][sym][idxs[k]] for k in eachindex(measurements) for i in eachindex(measurements[k])]
+
+"""Weighted covariance `Σ w (a - ā)(b - b̄)` for normalized weights `w`."""
+function _wcov(w, a, b)
+    a_mean = sum(w .* a)
+    b_mean = sum(w .* b)
+    return sum(w .* (a .- a_mean) .* (b .- b_mean))
+end
+
+"""
+    _reweight_at_betas(estimate, mbar)
+
+Calls `estimate(w, idxs, beta)` at every beta common to all states and collects
+`(betas, values, n_eff)`.
+"""
+function _reweight_at_betas(estimate, mbar::MBARState)
+    all_beta_vals = _common_betas(mbar.all_betas)
+    obs_mean = zeros(length(all_beta_vals))
+    obs_neff = zeros(length(all_beta_vals))
+
+    for (b_idx, beta) in enumerate(all_beta_vals)
+        w, idxs, n_eff = _weights(mbar, beta)
+        obs_mean[b_idx] = estimate(w, idxs, beta)
+        obs_neff[b_idx] = n_eff
+    end
+    return all_beta_vals, obs_mean, obs_neff
+end
+
+
+"""
     reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
 
-Uses a solved MBARState to cheaply reweight an observable across all unique betas.
+Uses a solved MBARState to cheaply reweight an observable to every beta common to all
+states. Returns `(betas, mean, n_eff)`.
 """
 function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
-
     obs_sym = Symbol(observable)
-    
-    all_beta_vals = _common_betas(mbar.all_betas)
-    n_betas = length(all_beta_vals)
-    
-    obs_mean = zeros(n_betas)
-    obs_neff = zeros(n_betas)
-
-    for (b_idx, beta) in enumerate(all_beta_vals)
-        log_w_tmp = Float64[]
-        obs_tmp   = Float64[]
-
-        for k in 1:mbar.K
-            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
-            isnothing(idx) && continue
-            
-            for i in 1:mbar.Nk[k]
-                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                
-                # Instantly retrieve the precalculated denominator
-                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-                push!(obs_tmp, mbar.measurements[k][i][obs_sym][idx])
-            end
-        end
-
-        if !isempty(log_w_tmp)
-            log_w_tmp .-= maximum(log_w_tmp)
-            w = exp.(log_w_tmp)
-            w ./= sum(w)
-            
-            obs_mean[b_idx] = sum(w .* obs_tmp)
-            obs_neff[b_idx] = 1.0 / sum(w .^ 2)
-        end
-    end
-
-    return all_beta_vals, obs_mean, obs_neff
-end
-
-
-
-function _warn_failed_replicates(n_failed::Int, n_bootstrap::Int)
-    if n_failed > 0
-        @warn "$n_failed of $n_bootstrap bootstrap replicates did not converge (they use their last MBAR iterate). Increase max_inter_mbar or loosen mbar_tol."
+    return _reweight_at_betas(mbar) do w, idxs, beta
+        sum(w .* _values(mbar.measurements, obs_sym, idxs))
     end
 end
 
 
+# ==============================================================================
+# β-DERIVATIVES
+# ==============================================================================
+
+_derivative_symbol(observable) = Symbol("∂β_", observable)
+
 """
-    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
+    add_beta_derivatives(all_measurements, all_betas, observables)
 
-Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
+Returns a copy of the measurements in which every sample also carries `∂β_<obs>`, the
+β-derivative of its trajectory from a cubic interpolating spline on the state's grid.
+
+The derivative estimators call this themselves when needed. Calling it once before
+bootstrapping avoids refitting the same splines in every replicate, which the bootstrap
+routines below do automatically.
 """
-function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, 
-                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8 )
+function add_beta_derivatives(all_measurements, all_betas, observables)
+    syms = Symbol.(observables)
+    dsyms = Tuple(_derivative_symbol.(syms))
 
+    return map(eachindex(all_measurements)) do k
+        betas_k = all_betas[k]
+        spline_order = min(3, length(betas_k) - 1)
 
-    for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
-        println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
+        map(all_measurements[k]) do m
+            devs = Tuple(spline_order > 0 ?
+                         derivative(Spline1D(betas_k, m[s], k=spline_order), betas_k, 1) :
+                         zeros(length(betas_k))
+                         for s in syms)
+            merge(m, NamedTuple{dsyms}(devs))
+        end
     end
-    
-    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
-
-
-    mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
-    betas_out, obs_mean, obs_neff = reweight_observable(mbar_full, observable)
-
-    n_betas  = length(betas_out)
-    K        = mbar_full.K
-    
-    boot_obs_mat = zeros(n_bootstrap, n_betas)
-    boot_f_mat   = zeros(n_bootstrap, K)
-    n_failed     = 0
-
-    # 2. Resample and create new MBAR states
-    for b in 1:n_bootstrap
-        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
-        
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        _, boot_obs, _ = reweight_observable(mbar_boot, observable)
-        
-        boot_obs_mat[b, :] = boot_obs
-        boot_f_mat[b, :]   = mbar_boot.free_energies
-        n_failed += !mbar_boot.converged
-    end
-    _warn_failed_replicates(n_failed, n_bootstrap)
-
-    obs_err         = vec(std(boot_obs_mat, dims=1))
-    free_energy_err = vec(std(boot_f_mat, dims=1))
-
-
-    println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
-    println("  beta_collapse    f (reduced)  stderr")
-    for (k, bc) in enumerate(beta_collapses)
-        @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
-    end
-
-    println("\nMBAR energy estimates (bootstrap n=$n_bootstrap):")
-    println("  beta       energy        stderr        N_eff")
-    for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
-        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
-    end
-    
-    return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
 end
 
-
-"""
-    precompute_observable_derivatives(mbar::MBARState, observable::Union{String, Symbol})
-
-Fits cubic splines to individual sample trajectories using their strictly native original beta arrays, and precalculates the 1st derivatives.
-"""
-function precompute_observable_derivatives(mbar::MBARState, observable::Union{String, Symbol})
-    obs_sym = Symbol(observable)
-    precomputed_devs = Vector{Vector{Float64}}[]
-    
-    for k in 1:mbar.K
-        betas_k = mbar.all_betas[k]
-        n_points = length(betas_k)
-        
-        spline_order = min(3, n_points - 1) 
-        
-        devs_k = Vector{Float64}[]
-        for i in 1:mbar.Nk[k]
-            y_vals = mbar.measurements[k][i][obs_sym]
-            
-            if spline_order > 0
-                spline = Spline1D(betas_k, y_vals, k=spline_order)
-
-                push!(devs_k, derivative(spline, betas_k, 1))
-            else
-                push!(devs_k, zeros(n_points))
-            end
-        end
-        push!(precomputed_devs, devs_k)
-    end
-    
-    return precomputed_devs
+"""Measurements with `∂β_<obs>` for every `observable`, fitting only the missing ones."""
+function _with_derivatives(all_measurements, all_betas, observables)
+    sample = first(first(all_measurements))
+    missing_obs = filter(o -> !hasproperty(sample, _derivative_symbol(o)), unique(Symbol.(observables)))
+    isempty(missing_obs) && return all_measurements
+    return add_beta_derivatives(all_measurements, all_betas, missing_obs)
 end
 
 """
-    reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol})
+    _derivative_estimate(w, measurements, idxs, observable, energy)
 
-Uses a solved MBARState to cheaply reweight an observable and its derivative across all unique betas.
+Reweighted `d⟨O⟩/dβ = -Cov(O, E) + ⟨dO/dβ⟩`: the first term comes from the β-dependence of
+the weights (`d ln q_β/dβ = -E` per sample), the second from that of each trajectory.
 """
-function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol})
+function _derivative_estimate(w, measurements, idxs, observable::Symbol, energy::Symbol)
+    O  = _values(measurements, observable, idxs)
+    E  = _values(measurements, energy, idxs)
+    dO = _values(measurements, _derivative_symbol(observable), idxs)
+    return -_wcov(w, O, E) + sum(w .* dO)
+end
 
-    obs_sym = Symbol(observable)
-    
-    all_beta_vals = _common_betas(mbar.all_betas)
-    n_betas = length(all_beta_vals)
-    
-    obs_mean = zeros(n_betas)
-    obs_neff = zeros(n_betas)
+"""
+    reweight_observable_dev(mbar::MBARState, observable; energy=:energy)
 
-    precomputed_devs = precompute_observable_derivatives(mbar, observable)
+Reweighted β-derivative `d⟨O⟩/dβ` of an observable at every beta common to all states.
+`energy` names the measured energy of the Hamiltonian that generated the evolution.
+Returns `(betas, d⟨O⟩/dβ, n_eff)`.
+"""
+function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symbol};
+                                 energy::Union{String, Symbol}=:energy)
+    obs_sym, e_sym = Symbol(observable), Symbol(energy)
+    meas = _with_derivatives(mbar.measurements, mbar.all_betas, [obs_sym, e_sym])
 
-    for (b_idx, beta) in enumerate(all_beta_vals)
-        log_w_tmp  = Float64[]
-        obs_tmp    = Float64[]
-        obs_dev    = Float64[]
-        energy_tmp = Float64[]
-
-        for k in 1:mbar.K
-            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
-            isnothing(idx) && continue
-            
-            for i in 1:mbar.Nk[k]
-                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                
-                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-                push!(obs_tmp, mbar.measurements[k][i][obs_sym][idx])
-                push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                push!(obs_dev, precomputed_devs[k][i][idx])
-            end
-        end
-
-        if !isempty(log_w_tmp)
-            log_w_tmp .-= maximum(log_w_tmp)
-            w = exp.(log_w_tmp)
-            w ./= sum(w)
-            
-            observable_mean = sum(w .* obs_tmp)
-            energy_mean     = sum(w .* energy_tmp)
-            dev_mean        = sum(w .* obs_dev)
-
-            # Equation: Fluctuation Term + Mean Derivative
-            obs_mean[b_idx] = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
-
-            obs_neff[b_idx] = 1.0 / sum(w .^ 2)
-        end
+    return _reweight_at_betas(mbar) do w, idxs, beta
+        _derivative_estimate(w, meas, idxs, obs_sym, e_sym)
     end
+end
 
-    return all_beta_vals, obs_mean, obs_neff
+"""
+    compute_elastocaloric_effect(mbar, energy, strain_terms, linear_coefficients)
+
+Adiabatic temperature response `(∂T/∂λ)_S = T (∂⟨A⟩/∂T) / C = (d⟨A⟩/dβ) / (β d⟨E⟩/dβ)` for a
+perturbation `H = H₀ + λ A` with `A = Σ_s c_s O_s` (`strain_terms` and
+`linear_coefficients`). Returns `(betas, (∂T/∂λ)_S, n_eff)`; NaN where `d⟨E⟩/dβ` or β vanish.
+"""
+function compute_elastocaloric_effect(mbar::MBARState, energy::Union{String, Symbol},
+                                      strain_terms::AbstractVector{<:Union{String, Symbol}},
+                                      linear_coefficients::Vector{Float64})
+    length(strain_terms) == length(linear_coefficients) ||
+        error("Got $(length(strain_terms)) strain_terms but $(length(linear_coefficients)) linear_coefficients.")
+
+    e_sym = Symbol(energy)
+    s_syms = Symbol.(strain_terms)
+    meas = _with_derivatives(mbar.measurements, mbar.all_betas, [e_sym; s_syms])
+
+    return _reweight_at_betas(mbar) do w, idxs, beta
+        dE_dbeta = _derivative_estimate(w, meas, idxs, e_sym, e_sym)   # ∝ heat capacity
+        if isapprox(dE_dbeta, 0.0; atol=1e-12) || isapprox(beta, 0.0; atol=1e-12)
+            return NaN
+        end
+        dA_dbeta = sum(c * _derivative_estimate(w, meas, idxs, s, e_sym) for (s, c) in zip(s_syms, linear_coefficients))
+        dA_dbeta / (dE_dbeta * beta)
+    end
 end
 
 
-
-"""
-    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
-Performs full MBAR bootstrap error analysis by generating bootstrapped MBARStates.
-"""
-function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, 
-                                 observable::Union{String, Symbol}; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8 )
-
-
-    for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
-        println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
-    end
-    
-    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
-
-
-    mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
-    betas_out, obs_mean, obs_neff = reweight_observable_dev(mbar_full, observable)
-
-    n_betas  = length(betas_out)
-    K        = mbar_full.K
-    
-    boot_obs_mat = zeros(n_bootstrap, n_betas)
-    boot_f_mat   = zeros(n_bootstrap, K)
-    n_failed     = 0
-
-    # 2. Resample and create new MBAR states
-    for b in 1:n_bootstrap
-        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
-        
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        _, boot_obs, _ = reweight_observable_dev(mbar_boot, observable)
-        
-        boot_obs_mat[b, :] = boot_obs
-        boot_f_mat[b, :]   = mbar_boot.free_energies
-        n_failed += !mbar_boot.converged
-    end
-    _warn_failed_replicates(n_failed, n_bootstrap)
-
-    obs_err         = vec(std(boot_obs_mat, dims=1))
-    free_energy_err = vec(std(boot_f_mat, dims=1))
-
-
-    println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
-    println("  beta_collapse    f (reduced)  stderr")
-    for (k, bc) in enumerate(beta_collapses)
-        @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
-    end
-
-    println("\nMBAR energy estimates (bootstrap n=$n_bootstrap):")
-    println("  beta       energy        stderr        N_eff")
-    for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
-        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
-    end
-    
-    return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
-end
-
-
-
-"""
-    compute_overlap_matrix(mbar::MBARState)
-"""
-function compute_overlap_matrix(all_measurements, all_betas, beta_collapses; n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
-
-    mbar = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
-
-    K = mbar.K
-    O = zeros(Float64, K, K)
-    
-    for i in 1:K
-        N_i = mbar.Nk[i]
-        if N_i == 0
-            continue # Skip states with no samples to avoid division by zero
-        end
-        
-        for j in 1:K
-            # If the target state j has no samples, its weight contribution is 0
-            if mbar.Nk[j] == 0
-                O[i, j] = 0.0
-                continue
-            end
-            
-            # Base log-weight term for state j: ln(N_j) + f_j
-            base_val = log(mbar.Nk[j]) + mbar.free_energies[j]
-            sum_weights = 0.0
-            
-            for n in 1:N_i
-                u_val = mbar.U[i][n, j]
-                
-                # Check for NaN values just as handled in the MBAR iterations
-                if !isnan(u_val)
-                    # W_{i,n,j} = exp(ln(N_j) + f_j + U_{i,n,j} - log_denom_{i,n})
-                    log_w = base_val + u_val - mbar.log_denom[i][n]
-                    sum_weights += exp(log_w)
-                end
-            end
-            
-            # Average the weights over all samples originally drawn from state i
-            O[i, j] = sum_weights / N_i
-        end
-    end
-    
-    return O
-end
-
+# ==============================================================================
+# FREE ENERGIES AND OVERLAP
+# ==============================================================================
 
 """
     compute_mbar_free_energies(mbar::MBARState)
+
 Computes the reduced free energies f(β) = -ln Z(β) at every beta present in all
 states' windows, using the MBAR self-consistency formula.
 
@@ -559,236 +429,204 @@ where Z = dim H) is included.
 Returns `(betas, f)`.
 """
 function compute_mbar_free_energies(mbar::MBARState)
-    # Betas available in every state's window
     all_beta_vals = _common_betas(mbar.all_betas)
-    n_betas = length(all_beta_vals)
-    
-    f_interp = zeros(n_betas)
+    f_interp = [-logsumexp(first(_log_weights(mbar, beta))) for beta in all_beta_vals]
 
-    for (b_idx, beta) in enumerate(all_beta_vals)
-        log_w_tmp = Float64[]
-
-        for k in 1:mbar.K
-            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
-            isnothing(idx) && continue
-            
-            for i in 1:mbar.Nk[k]
-                # Extract the reduced potential for the sample at the target beta
-                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                
-                # Accumulate the weight term: U_{k,i,beta} - log_denom_{k,i}
-                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-            end
-        end
-
-        if !isempty(log_w_tmp)
-            # f_beta = -ln( \sum exp(U - log_denom) )
-            f_interp[b_idx] = -logsumexp(log_w_tmp)
-        else
-            f_interp[b_idx] = NaN
-        end
-    end
-
-    # Align the reference state to 0.0 to exactly match mbar.free_energies.
-    # We find the index of the first beta collapse and shift the entire array.
-    base_idx = findfirst(b -> isapprox(b, mbar.beta_collapses[1]; atol=1e-8), all_beta_vals)
-    if !isnothing(base_idx)
-        f_interp .-= f_interp[base_idx]
-    else
-        f_interp .-= f_interp[1] # Fallback shift
-    end
+    # Gauge: f = 0 at the first beta_collapse, as in mbar.free_energies
+    base_idx = _beta_index(all_beta_vals, mbar.beta_collapses[1])
+    f_interp .-= f_interp[base_idx]
 
     return all_beta_vals, f_interp
 end
 
+"""
+    compute_overlap_matrix(mbar::MBARState)
 
-
+MBAR overlap matrix `O[i, j]`: the average, over samples of state i, of the probability
+that a sample came from state j. Rows sum to one; small off-diagonal neighbours mean
+the states barely overlap and their free-energy difference is poorly determined.
+"""
+function compute_overlap_matrix(mbar::MBARState)
+    K = mbar.K
+    O = zeros(Float64, K, K)
+    for i in 1:K, j in 1:K
+        log_base = log(mbar.Nk[j]) + mbar.free_energies[j]
+        O[i, j] = sum(exp(log_base + mbar.U[i][n, j] - mbar.log_denom[i][n]) for n in 1:mbar.Nk[i]) / mbar.Nk[i]
+    end
+    return O
+end
 
 """
-    bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; kwargs...)
-Performs full MBAR bootstrap error analysis on the intermediate free energies.
-Generates `n_bootstrap` resampled datasets, reconverges MBAR for each, and 
-calculates the standard deviation of the reduced free energies f(β) = ln Z(β₁) - ln Z(β)
-(see `compute_mbar_free_energies`).
-"""
-function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; 
-                                              n_bootstrap::Int=500, max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
+    compute_overlap_matrix(all_measurements, all_betas, beta_collapses; max_inter_mbar=1000, mbar_tol=1e-8)
 
-    # 1. Compute the reference state using the full, original dataset
+Solves MBAR for the data and returns its overlap matrix.
+"""
+function compute_overlap_matrix(all_measurements, all_betas, beta_collapses;
+                                max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
+    mbar = MBARState(all_measurements, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
+    return compute_overlap_matrix(mbar)
+end
+
+const MIN_NEIGHBOUR_OVERLAP = 0.03
+
+"""
+    check_overlap(mbar::MBARState; threshold=0.03)
+
+Warns for every pair of neighbouring states whose overlap `min(O[k,k+1], O[k+1,k])` is
+below `threshold` (the usual rule of thumb, e.g. Klimovich, Shirts & Mobley 2015). Below
+it, MBAR results between those states are unreliable even if the bootstrap errors look
+small; add a beta_collapse in between. Returns the overlap matrix.
+"""
+function check_overlap(mbar::MBARState; threshold::Float64=MIN_NEIGHBOUR_OVERLAP)
+    O = compute_overlap_matrix(mbar)
+    for k in 1:mbar.K-1
+        o = min(O[k, k+1], O[k+1, k])
+        if o < threshold
+            @warn @sprintf("Low overlap %.3g between beta_collapse %.4g and %.4g (threshold %.3g). Results between them are unreliable; add a beta_collapse in between.",
+                           o, mbar.beta_collapses[k], mbar.beta_collapses[k+1], threshold)
+        end
+    end
+    return O
+end
+
+
+# ==============================================================================
+# BOOTSTRAP
+# ==============================================================================
+
+function _warn_failed_replicates(n_failed::Int, n_bootstrap::Int)
+    if n_failed > 0
+        @warn "$n_failed of $n_bootstrap bootstrap replicates did not converge (they use their last MBAR iterate). Increase max_inter_mbar or loosen mbar_tol."
+    end
+end
+
+"""
+    _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses; n_bootstrap, max_inter_mbar, mbar_tol, verbose)
+
+Runs `estimator(mbar) -> (betas, values, n_eff)` on the full data and on `n_bootstrap`
+data sets resampled with replacement within each state, re-solving MBAR each time.
+Checks the overlap of the full solution. Returns a NamedTuple with `mbar`, `betas`,
+`values`, `values_err`, `n_eff` and `free_energy_err` (of the beta_collapse free energies).
+"""
+function _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
+                         n_bootstrap::Int, max_inter_mbar::Int, mbar_tol::Float64, verbose::Bool)
+    if verbose
+        for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
+            println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
+        end
+    end
+
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-    all_beta_vals, f_mean = compute_mbar_free_energies(mbar_full)
-    
-    n_betas = length(all_beta_vals)
-    K       = mbar_full.K
-    
-    # 2. Initialize matrices to hold the bootstrap results
-    boot_f_mat = zeros(n_bootstrap, n_betas)
-    n_failed   = 0
+    check_overlap(mbar_full)
+    betas_out, values, n_eff = estimator(mbar_full)
 
-    println("Starting bootstrap for intermediate free energies (n=$n_bootstrap)...")
+    boot_vals = zeros(n_bootstrap, length(betas_out))
+    boot_f    = zeros(n_bootstrap, mbar_full.K)
+    n_failed  = 0
 
-    # 3. Resample and create new MBAR states
     for b in 1:n_bootstrap
-        # Resample measurements with replacement
-        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
-        
-        # Converge a new MBAR state for this resampled data
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        
-        # Compute intermediate free energies for the boot state
-        _, f_boot = compute_mbar_free_energies(mbar_boot)
-        
-        boot_f_mat[b, :] = f_boot
+        meas_boot = [meas[rand(1:length(meas), length(meas))] for meas in all_measurements]
+        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol, verbose=false)
+
+        boot_vals[b, :] = estimator(mbar_boot)[2]
+        boot_f[b, :]    = mbar_boot.free_energies
         n_failed += !mbar_boot.converged
     end
     _warn_failed_replicates(n_failed, n_bootstrap)
 
-    # 4. Compute standard errors across the bootstrap dimension (dims=1)
-    f_err = vec(std(boot_f_mat, dims=1))
-
-    # 5. Print results gracefully
-    println("\nMBAR Intermediate Free Energies (bootstrap n=$n_bootstrap):")
-    println("  beta        f (reduced)   f_stderr")
-    for i in 1:n_betas
-        @printf("  %8.4f  %12.6f  %12.6f\n", all_beta_vals[i], f_mean[i], f_err[i])
-    end
-    
-    return all_beta_vals, f_mean, f_err
+    return (mbar=mbar_full, betas=betas_out, values=values, values_err=vec(std(boot_vals, dims=1)),
+            n_eff=n_eff, free_energy_err=vec(std(boot_f, dims=1)))
 end
 
-
-
-function compute_elastocaloric_effect(mbar::MBARState, energy::Union{String, Symbol}, strain_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64})
-    energy_sym = Symbol(energy)
-    
-    all_beta_vals = _common_betas(mbar.all_betas)
-    n_betas = length(all_beta_vals)
-    
-    obs_mean = zeros(n_betas)
-    obs_neff = zeros(n_betas)
-
-    # 1. Precompute all splines ONCE outside the loops
-    # (Assuming precompute_observable_derivatives already has the sortperm fix applied)
-    energy_devs = precompute_observable_derivatives(mbar, energy_sym)
-    strain_devs_list = [precompute_observable_derivatives(mbar, Symbol(s)) for s in strain_terms]
-
-    # 2. Outer loop: calculate weights ONCE per beta
-    for (b_idx, beta) in enumerate(all_beta_vals)
-        log_w_tmp  = Float64[]
-        energy_tmp = Float64[]
-        e_dev_tmp  = Float64[]
-        
-        # Collect the strain data per sample
-        strain_tmp_list = [Float64[] for _ in 1:length(strain_terms)]
-        strain_dev_list = [Float64[] for _ in 1:length(strain_terms)]
-
-        for k in 1:mbar.K
-            idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
-            isnothing(idx) && continue
-            
-            for i in 1:mbar.Nk[k]
-                ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-                
-                push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                push!(e_dev_tmp, energy_devs[k][i][idx])
-                
-                for (s_idx, s_sym) in enumerate(strain_terms)
-                    push!(strain_tmp_list[s_idx], mbar.measurements[k][i][Symbol(s_sym)][idx])
-                    push!(strain_dev_list[s_idx], strain_devs_list[s_idx][k][i][idx])
-                end
-            end
-        end
-
-        if !isempty(log_w_tmp)
-            # Re-normalize weights safely
-            log_w_tmp .-= maximum(log_w_tmp)
-            w = exp.(log_w_tmp)
-            w ./= sum(w)
-            
-            # Denominator calculations (Heat Capacity proportional term)
-            energy_mean = sum(w .* energy_tmp)
-            e_dev_mean  = sum(w .* e_dev_tmp)
-            dE_dbeta = -sum(w .* (energy_tmp .- energy_mean) .^ 2) + e_dev_mean
-
-            # ========================================================
-            # THE SAFEGUARD: Prevent division by zero and NaN-poisoning
-            # ========================================================
-            if isapprox(dE_dbeta, 0.0; atol=1e-12) || isapprox(beta, 0.0; atol=1e-12)
-                obs_mean[b_idx] = NaN
-                obs_neff[b_idx] = 1.0 / sum(w .^ 2)
-                continue
-            end
-            
-            # Numerator calculations (Strain susceptibility)
-            total_dS_dbeta = 0.0
-            for s_idx in 1:length(strain_terms)
-                strain_mean = sum(w .* strain_tmp_list[s_idx])
-                s_dev_mean  = sum(w .* strain_dev_list[s_idx])
-                
-                dS_dbeta = -sum(w .* (strain_tmp_list[s_idx] .- strain_mean) .* (energy_tmp .- energy_mean)) + s_dev_mean
-                total_dS_dbeta += dS_dbeta * linear_coefficients[s_idx]
-            end
-
-            # Final assembly: Numerator / (Denominator * beta)
-            obs_mean[b_idx] = total_dS_dbeta / (dE_dbeta * beta)
-            obs_neff[b_idx] = 1.0 / sum(w .^ 2)
-        end
-    end
-
-    return all_beta_vals, obs_mean, obs_neff
-end
-
-
-function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy::Union{String, Symbol}, plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64}; 
-    n_bootstrap::Int=500,max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
-
-
-    for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
-        println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
-    end
-    
-    @warn("Beware that the MBAR routines assume that log_norm is passed and not log_norm_square...")
-
-
-    mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
-    betas_out, obs_mean, obs_neff = compute_elastocaloric_effect(mbar_full, energy, plaquete_terms, linear_coefficients)
-
-    n_betas  = length(betas_out)
-    K        = mbar_full.K
-    
-    boot_obs_mat = zeros(n_bootstrap, n_betas)
-    boot_f_mat   = zeros(n_bootstrap, K)
-    n_failed     = 0
-
-    # 2. Resample and create new MBAR states
-    for b in 1:n_bootstrap
-        meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
-        
-        mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        _, boot_obs, _ = compute_elastocaloric_effect(mbar_boot, energy, plaquete_terms, linear_coefficients)
-        
-        boot_obs_mat[b, :] = boot_obs
-        boot_f_mat[b, :]   = mbar_boot.free_energies
-        n_failed += !mbar_boot.converged
-    end
-    _warn_failed_replicates(n_failed, n_bootstrap)
-
-    obs_err         = vec(std(boot_obs_mat, dims=1))
-    free_energy_err = vec(std(boot_f_mat, dims=1))
-
-
+function _print_bootstrap_summary(res, beta_collapses, label, n_bootstrap)
     println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
     println("  beta_collapse    f (reduced)  stderr")
     for (k, bc) in enumerate(beta_collapses)
-        @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
+        @printf("  %10.4f  %12.6f  %12.6f\n", bc, res.mbar.free_energies[k], res.free_energy_err[k])
     end
 
-    println("\nMBAR energy estimates (bootstrap n=$n_bootstrap):")
-    println("  beta       energy        stderr        N_eff")
-    for (beta, e, err, neff) in zip(betas_out, obs_mean, obs_err, obs_neff)
-        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, e, err, neff)
+    println("\nMBAR $label estimates (bootstrap n=$n_bootstrap):")
+    println("  beta       value         stderr        N_eff")
+    for (beta, v, err, neff) in zip(res.betas, res.values, res.values_err, res.n_eff)
+        @printf("  %6.3f  %12.6f  %12.6f  %8.1f\n", beta, v, err, neff)
     end
+end
 
-    return betas_out, obs_mean, obs_err, obs_neff, mbar_full.free_energies, free_energy_err
+"""
+    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+
+Reweights `observable` with MBAR and estimates its errors by bootstrapping.
+Returns `(betas, mean, err, n_eff, free_energies, free_energy_err)`.
+"""
+function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
+                                 observable::Union{String, Symbol}; n_bootstrap::Int=500, max_inter_mbar::Int=1000,
+                                 mbar_tol::Float64=1e-8, verbose::Bool=true)
+    res = _bootstrap_mbar(mbar -> reweight_observable(mbar, observable),
+                          all_measurements, all_betas, beta_collapses;
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+    verbose && _print_bootstrap_summary(res, beta_collapses, string(observable), n_bootstrap)
+    return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
+end
+
+"""
+    bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, observable; energy=:energy, n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+
+Bootstrapped `d⟨O⟩/dβ` (see `reweight_observable_dev`). The trajectory splines are fitted
+once, before resampling. Returns `(betas, d⟨O⟩/dβ, err, n_eff, free_energies, free_energy_err)`.
+"""
+function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses,
+                                     observable::Union{String, Symbol}; energy::Union{String, Symbol}=:energy,
+                                     n_bootstrap::Int=500, max_inter_mbar::Int=1000,
+                                     mbar_tol::Float64=1e-8, verbose::Bool=true)
+    meas = _with_derivatives(all_measurements, all_betas, [Symbol(observable), Symbol(energy)])
+    res = _bootstrap_mbar(mbar -> reweight_observable_dev(mbar, observable; energy=energy),
+                          meas, all_betas, beta_collapses;
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+    verbose && _print_bootstrap_summary(res, beta_collapses, "d$(observable)/dβ", n_bootstrap)
+    return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
+end
+
+"""
+    bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+
+Bootstrapped reduced free energies f(β) = ln Z(β₁) - ln Z(β) at every common beta
+(see `compute_mbar_free_energies`). Returns `(betas, f, f_err)`.
+"""
+function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses;
+                                     n_bootstrap::Int=500, max_inter_mbar::Int=1000,
+                                     mbar_tol::Float64=1e-8, verbose::Bool=true)
+    estimator = mbar -> begin
+        betas, f = compute_mbar_free_energies(mbar)
+        (betas, f, fill(NaN, length(betas)))
+    end
+    res = _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+
+    if verbose
+        println("\nMBAR Intermediate Free Energies (bootstrap n=$n_bootstrap):")
+        println("  beta        f (reduced)   f_stderr")
+        for (beta, f, err) in zip(res.betas, res.values, res.values_err)
+            @printf("  %8.4f  %12.6f  %12.6f\n", beta, f, err)
+        end
+    end
+    return res.betas, res.values, res.values_err
+end
+
+"""
+    bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy, terms, linear_coefficients; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+
+Bootstrapped `(∂T/∂λ)_S` (see `compute_elastocaloric_effect`). The trajectory splines
+are fitted once, before resampling.
+Returns `(betas, (∂T/∂λ)_S, err, n_eff, free_energies, free_energy_err)`.
+"""
+function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy::Union{String, Symbol},
+                                               plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64};
+                                               n_bootstrap::Int=500, max_inter_mbar::Int=1000,
+                                               mbar_tol::Float64=1e-8, verbose::Bool=true)
+    meas = _with_derivatives(all_measurements, all_betas, [Symbol(energy); Symbol.(plaquete_terms)])
+    res = _bootstrap_mbar(mbar -> compute_elastocaloric_effect(mbar, energy, plaquete_terms, linear_coefficients),
+                          meas, all_betas, beta_collapses;
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+    verbose && _print_bootstrap_summary(res, beta_collapses, "(∂T/∂λ)_S", n_bootstrap)
+    return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
 end

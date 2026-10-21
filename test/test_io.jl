@@ -86,3 +86,46 @@ end
     rm(tmp_file, force=true)
     rm(toml_file, force=true)
 end
+@testset "I/O: file integrity checks" begin
+    @testset "Evolved files must hold exactly one sample" begin
+        f = tempname() * ".hdf5"
+        d = DumpFile(f)
+        write_data!(d, "beta_collapse", 1.0)
+        dump!(d, "betas", [0.5, 1.0])
+        dump!(d, "energy", [1.0, 2.0])
+        dump!(d, "log_norm", [0.1, 0.2])
+        bc, betas, meas = @test_logs load_evolved_metts_file(f, ["energy"])
+        @test length(meas) == 1 && betas == [0.5, 1.0]
+
+        dump!(d, "energy", [1.0, 2.0])     # the job ran a second time
+        dump!(d, "log_norm", [0.1, 0.2])
+        @test_throws ErrorException load_evolved_metts_file(f, ["energy"])
+        rm(f, force=true)
+    end
+
+    @testset "Misaligned energy / product_state lengths are rejected" begin
+        f = tempname() * ".hdf5"
+        d = DumpFile(f)
+        write_data!(d, "beta_collapse", 1.0)
+        for i in 1:30
+            dump!(d, "energy", randn())
+            dump!(d, "product_state", rand(1:2, 4))
+        end
+        states, _ = redirect_stdout(devnull) do
+            get_uncorrelated_product_states(f, "energy"; not_use_prune=true)
+        end
+        @test size(states, 2) == 4
+
+        dump!(d, "energy", randn())        # killed before product_state was written
+        err = try
+            redirect_stdout(devnull) do
+                get_uncorrelated_product_states(f, "energy"; not_use_prune=true)
+            end
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("misaligned", err.msg)
+        rm(f, force=true)
+    end
+end

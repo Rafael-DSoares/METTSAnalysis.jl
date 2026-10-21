@@ -28,6 +28,7 @@ function hamiltonian()
 end
 
 const H = hamiltonian()
+const Sz_total = sum(site_op(sz, i) for i in 1:N)
 const ev, V = let F = eigen(Symmetric(H)); (F.values, F.vectors) end
 
 expH(b) = V * Diagonal(exp.(-b .* ev)) * V'
@@ -42,14 +43,37 @@ denergy(b) = (w = boltzmann(b); -(sum(w .* ev .^ 2) - sum(w .* ev)^2))
 function trajectory(s, betas, cache)
     log_norm = Float64[]
     en = Float64[]
+    mz = Float64[]
     for b in betas
         v = get!(() -> expH(b / 2), cache, b)[:, s]
         nv = norm(v)
         push!(log_norm, log(nv))
         φ = v / nv
         push!(en, dot(φ, H * φ))
+        push!(mz, dot(φ, Sz_total * φ))
     end
-    return (log_norm=log_norm, energy=en)
+    return (log_norm=log_norm, energy=en, mz=mz)
+end
+
+function entropy(Hλ, b)
+    e = eigvals(Symmetric(Hλ))
+    p = exp.(-b .* (e .- e[1]))
+    p ./= sum(p)
+    return -sum(x * log(x) for x in p if x > 0)
+end
+
+"""Exact (∂T/∂λ)_S for H + λ Sz_total at λ = 0, by following the isentrope."""
+function adiabatic_dT_dλ(b; δ=1e-4)
+    S0 = entropy(H, b)
+    function isentropic_T(λ)
+        lo, hi = b / 2, 2b                    # entropy decreases with β
+        for _ in 1:200
+            mid = (lo + hi) / 2
+            entropy(H + λ * Sz_total, mid) > S0 ? (lo = mid) : (hi = mid)
+        end
+        return 2 / (lo + hi)
+    end
+    return (isentropic_T(δ) - isentropic_T(-δ)) / (2δ)
 end
 
 function sample_states(rng, b, n)
@@ -110,6 +134,56 @@ end # module ToyED
         meas_short = [meas[1], meas[2], [(log_norm=m.log_norm[end-length(short[3])+1:end],
                                           energy=m.energy[end-length(short[3])+1:end]) for m in meas[3]]]
         @test_throws ErrorException MBARState(meas_short, short, bcs)
+    end
+
+    @testset "Energy key, precomputed derivatives and elastocaloric formula" begin
+        renamed = [[(log_norm=m.log_norm, en=m.energy, mz=m.mz) for m in c] for c in meas]
+        mb2 = MBARState(renamed, all_betas, bcs; max_iter=5000, tol=1e-10)
+        _, d_ref, _ = METTSAnalysis.reweight_observable_dev(mbar, "mz")
+        _, d_ren, _ = METTSAnalysis.reweight_observable_dev(mb2, "mz"; energy=:en)
+        @test d_ren ≈ d_ref
+
+        pre = add_beta_derivatives(meas, all_betas, ["mz", "energy"])
+        mb3 = MBARState(pre, all_betas, bcs; max_iter=5000, tol=1e-10)
+        @test METTSAnalysis.reweight_observable_dev(mb3, "mz")[2] ≈ d_ref
+
+        @test_throws ErrorException METTSAnalysis.compute_elastocaloric_effect(mbar, "energy", ["mz"], [1.0, 2.0])
+    end
+
+    @testset "Exhaustive enumeration at beta_collapse = 0 is exact" begin
+        # At β_c = 0 every product state has q = 1, so one copy of each is an exact
+        # "sample": the MBAR weights are exactly ⟨σ|e^{-βH}|σ⟩ and only spline errors remain.
+        grid = collect(0.0:0.05:3.0)
+        cache = Dict{Float64, Matrix{Float64}}()
+        all_states = [[ToyED.trajectory(s, grid, cache) for s in 1:2^ToyED.N]]
+        mb0 = MBARState(all_states, [grid], [0.0])
+
+        betas_out, e_mean, _ = reweight_observable(mb0, "energy")
+        @test e_mean ≈ ToyED.energy.(betas_out) rtol=1e-10
+
+        _, de_mean, _ = METTSAnalysis.reweight_observable_dev(mb0, "energy")
+        @test maximum(abs.(de_mean .- ToyED.denergy.(betas_out))) < 1e-3
+
+        _, dTdλ, _ = METTSAnalysis.compute_elastocaloric_effect(mb0, "energy", ["mz"], [1.0])
+        @test isnan(dTdλ[1])                                   # β = 0
+        for b in (1.0, 2.0)
+            i = findfirst(x -> isapprox(x, b; atol=1e-8), betas_out)
+            @test isapprox(dTdλ[i], ToyED.adiabatic_dT_dλ(b); rtol=1e-3)
+        end
+    end
+
+    @testset "Overlap matrix and check" begin
+        O = compute_overlap_matrix(mbar)
+        @test all(sum(O, dims=2) .≈ 1)
+        @test O ≈ compute_overlap_matrix(meas, all_betas, bcs; max_inter_mbar=5000, mbar_tol=1e-10) atol=1e-6
+        @test_logs check_overlap(mbar; threshold=1e-6)
+        @test_logs (:warn, r"Low overlap") match_mode=:any check_overlap(mbar; threshold=0.999)
+    end
+
+    @testset "Bootstrap routines run quietly with verbose=false" begin
+        out = @test_logs bootstrap_mbar_reweight(meas, all_betas, bcs, "energy"; n_bootstrap=3, verbose=false)
+        @test length(out) == 6
+        @test all(out[3] .> 0)
     end
 
     @testset "Non-convergence is reported and keeps the last iterate" begin

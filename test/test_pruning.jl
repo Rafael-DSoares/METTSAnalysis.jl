@@ -1,6 +1,7 @@
 using Test
 using TOML
 using Dumper
+using CairoMakie
 
 
 # Simulates keyboard input by using a temporary file stream
