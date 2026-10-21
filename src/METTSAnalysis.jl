@@ -23,7 +23,13 @@ function __init__()
     # Point users to CairoMakie when they call the plotting functions without it
     Base.Experimental.register_error_hint(MethodError) do io, exc, argtypes, kwargs
         if exc.f === prune_analysis || exc.f === prune_analysis_interval
-            print(io, "\n$(nameof(exc.f)) needs CairoMakie: run `using CairoMakie` first.")
+            if isdefined(Main, :CairoMakie)
+                # CairoMakie is loaded but the extension is not: the Manifest predates the extension
+                print(io, "\n$(nameof(exc.f)) needs the CairoMakie extension, which did not load. " *
+                          "Run `import Pkg; Pkg.resolve()` in this environment and restart Julia.")
+            else
+                print(io, "\n$(nameof(exc.f)) needs CairoMakie: run `using CairoMakie` first.")
+            end
         end
     end
 end
