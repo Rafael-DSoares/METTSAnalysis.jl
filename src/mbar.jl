@@ -35,7 +35,9 @@ function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_co
     f_new = zeros(K)
 
     ## create U matrix:
-    U = [fill(-Inf, Nk[k], K) for k in 1:K]
+    #U = [fill(-Inf, Nk[k], K) for k in 1:K]
+
+    U = [fill(NaN, Nk[k], K) for k in 1:K]
 
     for k in 1:K ## Loop over all states
         for j in 1:K ## Loop over all states
@@ -617,12 +619,12 @@ function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses
         end
     end
     
-    return all_beta_vals, F_mean, F_err
+    return all_beta_vals, f_mean, f_err
 end
 
 
 
-function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, Symbol}, plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64})
+function compute_elastocaloric_effect(mbar::MBARState, energy::Union{String, Symbol}, strain_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64})
     energy_sym = Symbol(energy)
     
     all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
@@ -631,58 +633,20 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
     obs_mean = zeros(n_betas)
     obs_neff = zeros(n_betas)
 
+    # 1. Precompute all splines ONCE outside the loops
+    # (Assuming precompute_observable_derivatives already has the sortperm fix applied)
     energy_devs = precompute_observable_derivatives(mbar, energy_sym)
+    strain_devs_list = [precompute_observable_derivatives(mbar, Symbol(s)) for s in strain_terms]
 
-    ## 1. Numerator: Sum over the plaquette terms
-    for (p_idx, plaquete) in enumerate(plaquete_terms)
-        
-        plaquete_sym = Symbol(plaquete)
-        # These are local to the plaquette loop now
-        plaquete_devs = precompute_observable_derivatives(mbar, plaquete_sym)
-
-        for (b_idx, beta) in enumerate(all_beta_vals)
-            log_w_tmp  = Float64[]
-            obs_tmp    = Float64[]
-            obs_dev    = Float64[]
-            energy_tmp = Float64[]
-
-            for k in 1:mbar.K
-                idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
-                isnothing(idx) && continue
-                
-                for i in 1:mbar.Nk[k]
-                    ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                    
-                    push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-                    push!(obs_tmp, mbar.measurements[k][i][plaquete_sym][idx])
-                    push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                    push!(obs_dev, plaquete_devs[k][i][idx]) # Using plaquette_devs
-                end
-            end
-
-            if !isempty(log_w_tmp)
-                log_w_tmp .-= maximum(log_w_tmp)
-                w = exp.(log_w_tmp)
-                w ./= sum(w)
-                
-                observable_mean = sum(w .* obs_tmp)
-                energy_mean     = sum(w .* energy_tmp)
-                dev_mean        = sum(w .* obs_dev)
-
-                # Equation: Fluctuation Term + Mean Derivative
-                dP_dbeta = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
-
-                obs_mean[b_idx] += dP_dbeta * linear_coefficients[p_idx] 
-            end
-        end
-    end
-
-    ## 2. Denominator: Total Energy derivative
+    # 2. Outer loop: calculate weights ONCE per beta
     for (b_idx, beta) in enumerate(all_beta_vals)
         log_w_tmp  = Float64[]
-        obs_tmp    = Float64[]
-        obs_dev    = Float64[]
         energy_tmp = Float64[]
+        e_dev_tmp  = Float64[]
+        
+        # Collect the strain data per sample
+        strain_tmp_list = [Float64[] for _ in 1:length(strain_terms)]
+        strain_dev_list = [Float64[] for _ in 1:length(strain_terms)]
 
         for k in 1:mbar.K
             idx = findfirst(b -> isapprox(b, beta; atol=1e-8), mbar.all_betas[k])
@@ -690,29 +654,50 @@ function compute_magneto_caloric_effect(mbar::MBARState, energy::Union{String, S
             
             for i in 1:mbar.Nk[k]
                 ln_num = 2 * mbar.measurements[k][i].log_norm[idx]
-                
                 push!(log_w_tmp, ln_num - mbar.log_denom[k][i])
-                push!(obs_tmp, mbar.measurements[k][i][energy_sym][idx])
+                
                 push!(energy_tmp, mbar.measurements[k][i][:energy][idx])
-                push!(obs_dev, energy_devs[k][i][idx]) # FIX: using the preserved energy_devs
+                push!(e_dev_tmp, energy_devs[k][i][idx])
+                
+                for (s_idx, s_sym) in enumerate(strain_terms)
+                    push!(strain_tmp_list[s_idx], mbar.measurements[k][i][Symbol(s_sym)][idx])
+                    push!(strain_dev_list[s_idx], strain_devs_list[s_idx][k][i][idx])
+                end
             end
         end
 
         if !isempty(log_w_tmp)
+            # Re-normalize weights safely
             log_w_tmp .-= maximum(log_w_tmp)
             w = exp.(log_w_tmp)
             w ./= sum(w)
             
-            observable_mean = sum(w .* obs_tmp)
-            energy_mean     = sum(w .* energy_tmp)
-            dev_mean        = sum(w .* obs_dev)
+            # Denominator calculations (Heat Capacity proportional term)
+            energy_mean = sum(w .* energy_tmp)
+            e_dev_mean  = sum(w .* e_dev_tmp)
+            dE_dbeta = -sum(w .* (energy_tmp .- energy_mean) .^ 2) + e_dev_mean
 
-            # Equation: Fluctuation Term + Mean Derivative
-            dE_dbeta = -sum(w .* (obs_tmp .- observable_mean) .* (energy_tmp .- energy_mean)) + dev_mean
+            # ========================================================
+            # THE SAFEGUARD: Prevent division by zero and NaN-poisoning
+            # ========================================================
+            if isapprox(dE_dbeta, 0.0; atol=1e-12) || isapprox(beta, 0.0; atol=1e-12)
+                obs_mean[b_idx] = NaN
+                obs_neff[b_idx] = 1.0 / sum(w .^ 2)
+                continue
+            end
+            
+            # Numerator calculations (Strain susceptibility)
+            total_dS_dbeta = 0.0
+            for s_idx in 1:length(strain_terms)
+                strain_mean = sum(w .* strain_tmp_list[s_idx])
+                s_dev_mean  = sum(w .* strain_dev_list[s_idx])
+                
+                dS_dbeta = -sum(w .* (strain_tmp_list[s_idx] .- strain_mean) .* (energy_tmp .- energy_mean)) + s_dev_mean
+                total_dS_dbeta += dS_dbeta * linear_coefficients[s_idx]
+            end
 
             # Final assembly: Numerator / (Denominator * beta)
-            obs_mean[b_idx] /= dE_dbeta * beta 
-
+            obs_mean[b_idx] = total_dS_dbeta / (dE_dbeta * beta)
             obs_neff[b_idx] = 1.0 / sum(w .^ 2)
         end
     end
@@ -733,7 +718,7 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
 
 
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses,max_iter=max_inter_mbar, tol=mbar_tol)
-    betas_out, obs_mean, obs_neff = compute_magneto_caloric_effect(mbar_full, energy, plaquete_terms, linear_coefficients)
+    betas_out, obs_mean, obs_neff = compute_elastocaloric_effect(mbar_full, energy, plaquete_terms, linear_coefficients)
 
     n_betas  = length(betas_out)
     K        = mbar_full.K
@@ -746,7 +731,7 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
         meas_boot = [all_measurements[k][rand(1:length(all_measurements[k]), length(all_measurements[k]))] for k in 1:K]
         
         mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-        _, boot_obs, _ = compute_magneto_caloric_effect(mbar_boot, energy, plaquete_terms, linear_coefficients)
+        _, boot_obs, _ = compute_elastocaloric_effect(mbar_boot, energy, plaquete_terms, linear_coefficients)
         
         boot_obs_mat[b, :] = boot_obs
         boot_f_mat[b, :]   = mbar_boot.free_energies
