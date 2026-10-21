@@ -4,13 +4,13 @@ using Statistics
 using StatsBase
 using Dierckx
 
-export pool_states, pool_states_single,logsumexp
+export pool_states, pool_states_single, group_chains_single, logsumexp
 include("aux.jl")
 
 export prune_analysis, prune, prune_interval, prune_analysis_interval
 include("pruning.jl")
 
-export average_observable_single
+export average_observable_single, effective_sample_size
 include("analysis.jl")
 
 export load_metts_file_interval, load_metts_file, write_product_states_uncorrelated_interval, write_product_states_uncorrelated, get_uncorrelated_product_states, read_run_parameters, check_run_parameters

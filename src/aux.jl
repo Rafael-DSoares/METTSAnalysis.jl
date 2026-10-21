@@ -82,6 +82,29 @@ end
 
 
 
+"""
+    group_chains_single(all_measurements, beta_collapses)
+
+Like `pool_states_single`, but keeps the files (seeds) of each beta_collapse as separate
+chains instead of concatenating them, so that autocorrelation errors can be computed per
+chain (see `average_observable_single`).
+
+Returns `(chains_per_beta, unique_beta_collapses)`, where `chains_per_beta[j]` is the
+vector of chains at `unique_beta_collapses[j]`.
+"""
+function group_chains_single(all_measurements, beta_collapses)
+    @assert issorted(beta_collapses) "beta_collapses must be sorted ascending"
+
+    unique_betas = _unique_approx(beta_collapses)
+    chains_per_beta = [all_measurements[findall(b -> isapprox(b, β; atol=1e-8), beta_collapses)]
+                       for β in unique_betas]
+
+    return chains_per_beta, unique_betas
+end
+
+
+
+
 function logsumexp(x::AbstractVector{<:Real})
     m = maximum(x)
     return m + log(sum(exp.(x .- m)))
