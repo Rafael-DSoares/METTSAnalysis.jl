@@ -13,7 +13,7 @@ include("pruning.jl")
 export average_observable_single
 include("analysis.jl")
 
-export load_metts_file_interval, load_metts_file, write_product_states_uncorrelated_interval, write_product_states_uncorrelated, get_uncorrelated_product_states
+export load_metts_file_interval, load_metts_file, write_product_states_uncorrelated_interval, write_product_states_uncorrelated, get_uncorrelated_product_states, read_run_parameters, check_run_parameters
 include("io.jl")
 
 export MBARState, reweight_observable, bootstrap_mbar_reweight, bootstrap_mbar_reweight_dev, compute_overlap_matrix, bootstrap_all_free_energies, bootstrap_mbar_magneto_caloric_effect

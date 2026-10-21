@@ -13,6 +13,30 @@ struct MBARState{T}
     U::Vector{Matrix{Float64}}            # Pre-calculated log weight matrix log(p_α)
     free_energies::Vector{Float64}        # The converged free energies (f)
     log_denom::Vector{Vector{Float64}}    # The converged denominators for reweighting
+    converged::Bool                       # Whether the self-consistent iteration reached `tol`
+end
+
+
+const BETA_ATOL = 1e-8
+
+_beta_index(betas, β) = findfirst(b -> isapprox(b, β; atol=BETA_ATOL), betas)
+
+"""
+    _common_betas(all_betas)
+
+Betas present in every state's grid (compared within `BETA_ATOL`), taken from the first grid.
+
+MBAR can only reweight to a β where every sample's log_norm is known; reweighting with
+the subset of samples whose window contains β is biased. The tolerance also removes the
+float-noise duplicates that `unique` keeps (e.g. 1.2 and 1.2000000000000002).
+"""
+function _common_betas(all_betas)
+    common = [β for β in sort(all_betas[1]) if all(b -> !isnothing(_beta_index(b, β)), all_betas)]
+    n_all = length(_unique_approx(sort(vcat(all_betas...)); atol=BETA_ATOL))
+    if length(common) < n_all
+        @warn "Only $(length(common)) of $n_all betas are present in every state's window; reweighting is restricted to those." maxlog=1
+    end
+    return common
 end
 
 """
@@ -28,7 +52,16 @@ function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_co
     Nk = [length(meas) for meas in all_measurements] ###  the number of measurments per each beta_collapse. Length only looks to the outer data. We assume that the data is organized as the function load_metts work.
     
     @assert length(all_measurements) == K && length(all_betas) == K
-    
+
+    # Every sample needs log_norm at every beta_collapse: a missing entry is not a zero
+    # probability but an unknown one, and dropping it from the denominator biases MBAR.
+    for k in 1:K, j in 1:K
+        if isnothing(_beta_index(all_betas[k], beta_collapses[j]))
+            error("beta_collapses[$j] = $(beta_collapses[j]) is outside the beta window of state $k " *
+                  "([$(first(all_betas[k])), $(last(all_betas[k]))]). Every state's window must contain all beta_collapses.")
+        end
+    end
+
     # 1. Initialize first with chained BAR (this makes MBAR converge faster!)
     _, f_init = chained_bar(all_measurements, all_betas, beta_collapses)
     f = copy(f_init)
@@ -41,11 +74,9 @@ function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_co
 
     for k in 1:K ## Loop over all states
         for j in 1:K ## Loop over all states
-            idx = findfirst(b -> isapprox(b, beta_collapses[j]; atol=1e-8), all_betas[k]) ## find for a;; states in k which measurments were done at the collapse temperature. If there is none the probabity is zero.
-            if !isnothing(idx)
-                for i in 1:Nk[k]
-                    U[k][i, j] = 2 * all_measurements[k][i].log_norm[idx] 
-                end
+            idx = _beta_index(all_betas[k], beta_collapses[j]) ## index in state k's grid of the collapse temperature of state j (guaranteed to exist by the check above)
+            for i in 1:Nk[k]
+                U[k][i, j] = 2 * all_measurements[k][i].log_norm[idx]
             end
         end
     end
@@ -55,37 +86,38 @@ function MBARState(all_measurements, all_betas::Vector{Vector{Float64}}, beta_co
 
     ### try to convege the free_energies
     converged = false
-    last_error = 0.0
+    last_error = Inf
+    n_iter = 0
 
     for iter in 1:max_iter
+        n_iter = iter
         # Step A: Update log denominators
         _update_log_denom!(log_denom, U, f, K, Nk)
 
         # Step B: Update free energies
         _update_free_energies!(f_new, f, U, log_denom, K, Nk)
 
-        f_new .= alpha .* f .+ (1.0 - alpha) .* f_new #### simple non-linear solver with relexation parameter
-
+        # Check convergence on the undamped update, so that `tol` is the actual tolerance
         last_error = maximum(abs.(f_new .- f))
-        # Check convergence
         if last_error < tol
             converged = true
+            f .= f_new
             break
         end
-        f .= f_new
+
+        f .= alpha .* f .+ (1.0 - alpha) .* f_new #### simple non-linear solver with relexation parameter
     end
-    
+
     if converged
-        @info "MBAR successfully converged in $max_iter iterations."
-        f .= f_new
+        @info "MBAR successfully converged in $n_iter iterations."
     else
-        @warn "MBAR did not converge (Last error: $last_error). Falling back to exact Chained BAR (FEP) free energies."
-        f .= f_init
+        # The last iterate is a better estimate than the one-sided chained FEP initial guess
+        @warn "MBAR did not converge after $max_iter iterations (last error: $last_error). Using the last iterate."
     end
 
     _update_log_denom!(log_denom, U, f, K, Nk)
 
-    return MBARState(all_measurements, all_betas, beta_collapses, K, Nk, U, f, log_denom)
+    return MBARState(all_measurements, all_betas, beta_collapses, K, Nk, U, f, log_denom, converged)
 end
 
 
@@ -213,7 +245,7 @@ function reweight_observable(mbar::MBARState, observable::Union{String, Symbol})
 
     obs_sym = Symbol(observable)
     
-    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    all_beta_vals = _common_betas(mbar.all_betas)
     n_betas = length(all_beta_vals)
     
     obs_mean = zeros(n_betas)
@@ -251,6 +283,13 @@ end
 
 
 
+function _warn_failed_replicates(n_failed::Int, n_bootstrap::Int)
+    if n_failed > 0
+        @warn "$n_failed of $n_bootstrap bootstrap replicates did not converge (they use their last MBAR iterate). Increase max_inter_mbar or loosen mbar_tol."
+    end
+end
+
+
 """
     bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500)
 
@@ -275,6 +314,7 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
     
     boot_obs_mat = zeros(n_bootstrap, n_betas)
     boot_f_mat   = zeros(n_bootstrap, K)
+    n_failed     = 0
 
     # 2. Resample and create new MBAR states
     for b in 1:n_bootstrap
@@ -285,14 +325,16 @@ function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
         
         boot_obs_mat[b, :] = boot_obs
         boot_f_mat[b, :]   = mbar_boot.free_energies
+        n_failed += !mbar_boot.converged
     end
+    _warn_failed_replicates(n_failed, n_bootstrap)
 
     obs_err         = vec(std(boot_obs_mat, dims=1))
     free_energy_err = vec(std(boot_f_mat, dims=1))
 
 
     println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
-    println("  beta_collapse    F            stderr")
+    println("  beta_collapse    f (reduced)  stderr")
     for (k, bc) in enumerate(beta_collapses)
         @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
     end
@@ -349,7 +391,7 @@ function reweight_observable_dev(mbar::MBARState, observable::Union{String, Symb
 
     obs_sym = Symbol(observable)
     
-    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    all_beta_vals = _common_betas(mbar.all_betas)
     n_betas = length(all_beta_vals)
     
     obs_mean = zeros(n_betas)
@@ -421,6 +463,7 @@ function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses
     
     boot_obs_mat = zeros(n_bootstrap, n_betas)
     boot_f_mat   = zeros(n_bootstrap, K)
+    n_failed     = 0
 
     # 2. Resample and create new MBAR states
     for b in 1:n_bootstrap
@@ -431,14 +474,16 @@ function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses
         
         boot_obs_mat[b, :] = boot_obs
         boot_f_mat[b, :]   = mbar_boot.free_energies
+        n_failed += !mbar_boot.converged
     end
+    _warn_failed_replicates(n_failed, n_bootstrap)
 
     obs_err         = vec(std(boot_obs_mat, dims=1))
     free_energy_err = vec(std(boot_f_mat, dims=1))
 
 
     println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
-    println("  beta_collapse    F            stderr")
+    println("  beta_collapse    f (reduced)  stderr")
     for (k, bc) in enumerate(beta_collapses)
         @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
     end
@@ -503,17 +548,22 @@ end
 
 """
     compute_mbar_free_energies(mbar::MBARState)
-Computes the reduced (f) and actual (F) free energies across all unique 
-intermediate temperatures (betas) present in the MBAR measurements using 
-the exact MBAR self-consistency formula.
+Computes the reduced free energies f(β) = -ln Z(β) at every beta present in all
+states' windows, using the MBAR self-consistency formula.
+
+f is only determined up to an additive constant and is gauged so that
+f(beta_collapses[1]) = 0, i.e. f(β) = ln Z(β₁) - ln Z(β). Only differences are
+physical: f/β is NOT the free energy F unless an absolute reference (e.g. β = 0,
+where Z = dim H) is included.
+
+Returns `(betas, f)`.
 """
 function compute_mbar_free_energies(mbar::MBARState)
-    # Collect and sort all unique betas available in the dataset
-    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    # Betas available in every state's window
+    all_beta_vals = _common_betas(mbar.all_betas)
     n_betas = length(all_beta_vals)
     
     f_interp = zeros(n_betas)
-    F_interp = zeros(n_betas)
 
     for (b_idx, beta) in enumerate(all_beta_vals)
         log_w_tmp = Float64[]
@@ -548,41 +598,32 @@ function compute_mbar_free_energies(mbar::MBARState)
         f_interp .-= f_interp[1] # Fallback shift
     end
 
-    # Compute actual free energies F = f / beta
-    for i in 1:n_betas
-        beta = all_beta_vals[i]
-        if isapprox(beta, 0.0; atol=1e-12)
-            F_interp[i] = NaN # Handle edge case to avoid DivisionByZero
-        else
-            F_interp[i] = f_interp[i] / beta
-        end
-    end
-
-    return all_beta_vals, f_interp, F_interp
+    return all_beta_vals, f_interp
 end
 
 
 
 
 """
-    bootstrap_intermediate_free_energies(all_measurements, all_betas, beta_collapses; kwargs...)
+    bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; kwargs...)
 Performs full MBAR bootstrap error analysis on the intermediate free energies.
 Generates `n_bootstrap` resampled datasets, reconverges MBAR for each, and 
-calculates the standard deviation of both the reduced (f) and actual (F) free energies.
+calculates the standard deviation of the reduced free energies f(β) = ln Z(β₁) - ln Z(β)
+(see `compute_mbar_free_energies`).
 """
 function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; 
                                               n_bootstrap::Int=500, max_inter_mbar::Int=1000, mbar_tol::Float64=1e-8)
 
     # 1. Compute the reference state using the full, original dataset
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
-    all_beta_vals, f_mean, F_mean = compute_mbar_free_energies(mbar_full)
+    all_beta_vals, f_mean = compute_mbar_free_energies(mbar_full)
     
     n_betas = length(all_beta_vals)
     K       = mbar_full.K
     
     # 2. Initialize matrices to hold the bootstrap results
     boot_f_mat = zeros(n_bootstrap, n_betas)
-    boot_F_mat = zeros(n_bootstrap, n_betas)
+    n_failed   = 0
 
     println("Starting bootstrap for intermediate free energies (n=$n_bootstrap)...")
 
@@ -595,28 +636,21 @@ function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses
         mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
         
         # Compute intermediate free energies for the boot state
-        _, f_boot, F_boot = compute_mbar_free_energies(mbar_boot)
+        _, f_boot = compute_mbar_free_energies(mbar_boot)
         
         boot_f_mat[b, :] = f_boot
-        boot_F_mat[b, :] = F_boot
+        n_failed += !mbar_boot.converged
     end
+    _warn_failed_replicates(n_failed, n_bootstrap)
 
     # 4. Compute standard errors across the bootstrap dimension (dims=1)
     f_err = vec(std(boot_f_mat, dims=1))
-    F_err = vec(std(boot_F_mat, dims=1))
 
     # 5. Print results gracefully
     println("\nMBAR Intermediate Free Energies (bootstrap n=$n_bootstrap):")
-    println("  beta        F (actual)    F_stderr      f (reduced)   f_stderr")
+    println("  beta        f (reduced)   f_stderr")
     for i in 1:n_betas
-        # Handle formatting for cases where beta=0 might result in NaN for F
-        if isnan(F_mean[i])
-            @printf("  %8.4f           NaN           NaN  %12.6f  %12.6f\n", 
-                    all_beta_vals[i], f_mean[i], f_err[i])
-        else
-            @printf("  %8.4f  %12.6f  %12.6f  %12.6f  %12.6f\n", 
-                    all_beta_vals[i], F_mean[i], F_err[i], f_mean[i], f_err[i])
-        end
+        @printf("  %8.4f  %12.6f  %12.6f\n", all_beta_vals[i], f_mean[i], f_err[i])
     end
     
     return all_beta_vals, f_mean, f_err
@@ -627,7 +661,7 @@ end
 function compute_elastocaloric_effect(mbar::MBARState, energy::Union{String, Symbol}, strain_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64})
     energy_sym = Symbol(energy)
     
-    all_beta_vals = sort(unique(vcat(mbar.all_betas...)))
+    all_beta_vals = _common_betas(mbar.all_betas)
     n_betas = length(all_beta_vals)
     
     obs_mean = zeros(n_betas)
@@ -725,6 +759,7 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
     
     boot_obs_mat = zeros(n_bootstrap, n_betas)
     boot_f_mat   = zeros(n_bootstrap, K)
+    n_failed     = 0
 
     # 2. Resample and create new MBAR states
     for b in 1:n_bootstrap
@@ -735,14 +770,16 @@ function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta
         
         boot_obs_mat[b, :] = boot_obs
         boot_f_mat[b, :]   = mbar_boot.free_energies
+        n_failed += !mbar_boot.converged
     end
+    _warn_failed_replicates(n_failed, n_bootstrap)
 
     obs_err         = vec(std(boot_obs_mat, dims=1))
     free_energy_err = vec(std(boot_f_mat, dims=1))
 
 
     println("\nMBAR free energies (bootstrap n=$n_bootstrap):")
-    println("  beta_collapse    F            stderr")
+    println("  beta_collapse    f (reduced)  stderr")
     for (k, bc) in enumerate(beta_collapses)
         @printf("  %10.4f  %12.6f  %12.6f\n", bc,  mbar_full.free_energies[k], free_energy_err[k])
     end
