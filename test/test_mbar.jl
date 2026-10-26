@@ -191,6 +191,60 @@ end # module ToyED
         @test !m.converged
         @test all(isfinite, m.free_energies)
     end
+
+    @testset "Block bootstrap" begin
+        blocks_of = METTSAnalysis._blocks
+        @test blocks_of([1, 1, 1, 2, 2, 3], 2) == [1:2, 3:3, 4:5, 6:6]
+        @test blocks_of([1, 1, 1, 2, 2, 3], 10) == [1:3, 4:5, 6:6]
+        @test blocks_of([1, 1, 2], 1) == [1:1, 2:2, 3:3]
+        @test_throws ErrorException blocks_of([1, 2, 1], 2)   # chain 1 not contiguous
+        @test_throws ErrorException blocks_of([1, 1], 0)
+
+        # A replicate is a sequence of whole blocks, the last one possibly cut
+        blocks = blocks_of(repeat(1:4, inner=5), 3)
+        idx = METTSAnalysis._block_resample(MersenneTwister(1), blocks, 20)
+        @test length(idx) == 20
+        p = 1
+        while p <= 20
+            b = findfirst(bl -> first(bl) == idx[p], blocks)
+            @test !isnothing(b)
+            len = min(length(blocks[b]), 21 - p)
+            @test idx[p:p+len-1] == collect(blocks[b])[1:len]
+            p += len
+        end
+
+        # One sample per chain: blocks of one sample, i.e. the ordinary bootstrap
+        estimator = m -> reweight_observable(m, "energy")
+        opts = (n_bootstrap=5, max_inter_mbar=1000, mbar_tol=1e-8, verbose=false)
+        plain = METTSAnalysis._bootstrap_mbar(estimator, meas, all_betas, bcs; opts..., rng=MersenneTwister(7))
+        singles = METTSAnalysis._bootstrap_mbar(estimator, meas, all_betas, bcs; opts..., rng=MersenneTwister(7),
+                                                groups=[collect(eachindex(m)) for m in meas], block_length=3)
+        @test plain.values_err == singles.values_err
+
+        # Every state stored twice in a row (perfectly correlated pairs): the ordinary
+        # bootstrap sees twice the independent samples and underestimates the error by √2;
+        # blocks of the two copies restore it
+        doubled = [vcat([[x, x] for x in m]...) for m in meas]
+        pairs = [repeat(1:length(m), inner=2) for m in meas]
+        err_plain = bootstrap_mbar_reweight(doubled, all_betas, bcs, "energy"; n_bootstrap=300, verbose=false)[3]
+        err_block = bootstrap_mbar_reweight(doubled, all_betas, bcs, "energy"; n_bootstrap=300, verbose=false,
+                                            groups=pairs, block_length=2)[3]
+        @test 1.25 < mean(err_block ./ err_plain) < 1.6
+
+        @test_throws ErrorException bootstrap_mbar_reweight(meas, all_betas, bcs, "energy"; n_bootstrap=2, verbose=false,
+                                                            groups=[[1, 2]], block_length=2)
+
+        # Whole chains with a single chain per state: nothing to resample
+        one_chain = [fill(1, length(m)) for m in meas]
+        @test_throws ErrorException bootstrap_mbar_reweight(meas, all_betas, bcs, "energy"; n_bootstrap=2, verbose=false,
+                                                            groups=one_chain, block_length=typemax(Int))
+
+        # Whole chains: four chains per state, errors include √(4/3)
+        four = [repeat(1:4, inner=cld(length(m), 4))[1:length(m)] for m in meas]
+        whole = METTSAnalysis._bootstrap_mbar(estimator, meas, all_betas, bcs; opts..., n_bootstrap=50,
+                                              groups=four, block_length=typemax(Int), rng=MersenneTwister(3))
+        @test all(isfinite, whole.values_err) && all(whole.values_err .> 0)
+    end
 end
 
 @testset "pool_states groups beta_collapses within tolerance" begin

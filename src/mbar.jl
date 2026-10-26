@@ -1,4 +1,5 @@
 using Dierckx
+using Random
 
 """
 Holds the converged state of an MBAR calculation, including the precalculated 
@@ -501,19 +502,92 @@ function _warn_failed_replicates(n_failed::Int, n_bootstrap::Int)
 end
 
 """
-    _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses; n_bootstrap, max_inter_mbar, mbar_tol, verbose)
+    _blocks(chain, block_length)
+
+Splits samples `1:length(chain)` into consecutive blocks of at most `block_length` samples
+that never cross from one chain to the next. `chain[i]` labels the chain (e.g. the seed) of
+sample `i`; the samples of each chain must be contiguous and in chain order.
+"""
+function _blocks(chain::AbstractVector, block_length::Int)
+    block_length >= 1 || error("block_length must be at least 1, got $block_length.")
+    n = length(chain)
+    finished = Set{eltype(chain)}()
+    blocks = UnitRange{Int}[]
+    start = 1
+    for i in 2:(n + 1)
+        new_chain = i <= n && chain[i] != chain[start]
+        if i > n || new_chain || i - start == block_length
+            push!(blocks, start:(i - 1))
+            if new_chain
+                push!(finished, chain[start])
+                chain[i] in finished &&
+                    error("The samples of chain $(chain[i]) are not contiguous; sort the samples of each state by chain.")
+            end
+            start = i
+        end
+    end
+    return blocks
+end
+
+"""
+    _block_resample(rng, blocks, n)
+
+Indices of a block-bootstrap replicate: whole blocks drawn with replacement until `n`
+samples are reached, the last block cut so that the replicate has exactly `n` samples
+(MBAR needs the number of samples per state). With blocks of length 1 this is the ordinary
+bootstrap.
+"""
+function _block_resample(rng::AbstractRNG, blocks::Vector{UnitRange{Int}}, n::Int)
+    idx = Int[]
+    while length(idx) < n
+        append!(idx, blocks[rand(rng, 1:length(blocks))])
+    end
+    return resize!(idx, n)
+end
+
+"""
+    _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses; n_bootstrap, max_inter_mbar, mbar_tol, verbose, groups=nothing, block_length=1, rng=Random.default_rng())
 
 Runs `estimator(mbar) -> (betas, values, n_eff)` on the full data and on `n_bootstrap`
 data sets resampled with replacement within each state, re-solving MBAR each time.
 Checks the overlap of the full solution. Returns a NamedTuple with `mbar`, `betas`,
 `values`, `values_err`, `n_eff` and `free_energy_err` (of the beta_collapse free energies).
+
+By default single samples are resampled, which assumes that the product states of a state
+are independent. States thinned from a Markov chain can still be correlated, and their
+errors then come out too small. For them pass `groups`, one vector per state with the chain
+(e.g. the seed) of every sample, the samples of a chain contiguous and in chain order, and
+`block_length > 1`: runs of up to `block_length` consecutive samples of one chain are
+resampled together (block bootstrap). A `block_length` of at least the chain length
+resamples whole chains, which is valid whatever the correlation within a chain but is itself
+uncertain when there are few chains.
+
+With G resampled units (samples or blocks) the bootstrap variance of a mean is too small by
+(G-1)/G, which matters when whole chains are resampled (G = 5 seeds: errors 11% too small).
+The errors are multiplied by √(G/(G-1)), with G the smallest number of units of any state.
 """
 function _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
-                         n_bootstrap::Int, max_inter_mbar::Int, mbar_tol::Float64, verbose::Bool)
+                         n_bootstrap::Int, max_inter_mbar::Int, mbar_tol::Float64, verbose::Bool,
+                         groups=nothing, block_length::Int=1, rng::AbstractRNG=Random.default_rng())
+    # Blocks of every state; without groups the samples of a state form one chain
+    isnothing(groups) || length(groups) == length(all_measurements) ||
+        error("groups has $(length(groups)) entries but there are $(length(all_measurements)) states.")
+    blocks = map(eachindex(all_measurements)) do k
+        chain = isnothing(groups) ? fill(1, length(all_measurements[k])) : groups[k]
+        length(chain) == length(all_measurements[k]) ||
+            error("groups[$k] has $(length(chain)) labels but state $k has $(length(all_measurements[k])) samples.")
+        _blocks(chain, block_length)
+    end
+    n_units = minimum(length, blocks)
+    n_units >= 2 || error("A state has only $n_units bootstrap unit(s); the bootstrap needs at least 2 (more chains, or a shorter block_length).")
+    small_sample_factor = sqrt(n_units / (n_units - 1))
+
     if verbose
         for (k, (bc, betas, meas)) in enumerate(zip(beta_collapses, all_betas, all_measurements))
-            println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))")
+            println("  state $k: beta_collapse = $bc, window = [$(betas[1]), $(betas[end])], N = $(length(meas))" *
+                    (block_length > 1 ? ", $(length(blocks[k])) blocks" : ""))
         end
+        block_length > 1 && println("  block bootstrap with block_length = $block_length")
     end
 
     mbar_full = MBARState(all_measurements, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol)
@@ -525,7 +599,7 @@ function _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
     n_failed  = 0
 
     for b in 1:n_bootstrap
-        meas_boot = [meas[rand(1:length(meas), length(meas))] for meas in all_measurements]
+        meas_boot = [meas[_block_resample(rng, blocks[k], length(meas))] for (k, meas) in enumerate(all_measurements)]
         mbar_boot = MBARState(meas_boot, all_betas, beta_collapses; max_iter=max_inter_mbar, tol=mbar_tol, verbose=false)
 
         boot_vals[b, :] = estimator(mbar_boot)[2]
@@ -534,8 +608,8 @@ function _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
     end
     _warn_failed_replicates(n_failed, n_bootstrap)
 
-    return (mbar=mbar_full, betas=betas_out, values=values, values_err=vec(std(boot_vals, dims=1)),
-            n_eff=n_eff, free_energy_err=vec(std(boot_f, dims=1)))
+    return (mbar=mbar_full, betas=betas_out, values=values, values_err=small_sample_factor .* vec(std(boot_vals, dims=1)),
+            n_eff=n_eff, free_energy_err=small_sample_factor .* vec(std(boot_f, dims=1)))
 end
 
 function _print_bootstrap_summary(res, beta_collapses, label, n_bootstrap)
@@ -553,23 +627,34 @@ function _print_bootstrap_summary(res, beta_collapses, label, n_bootstrap)
 end
 
 """
-    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+    bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses, observable; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true, groups=nothing, block_length=1)
 
 Reweights `observable` with MBAR and estimates its errors by bootstrapping.
 Returns `(betas, mean, err, n_eff, free_energies, free_energy_err)`.
+
+The bootstrap resamples single product states, which assumes they are independent. If the
+states of a beta_collapse were thinned from Markov chains and are still correlated, pass
+`groups` (one vector per state with the chain, e.g. the seed, of every sample; the samples of
+each chain contiguous and in chain order) and `block_length > 1`: runs of up to
+`block_length` consecutive states of one chain are then resampled together (block
+bootstrap). `block_length` at least as long as the chains resamples whole chains; tested on
+exact METTS samples, this is the choice that stays correct for strongly correlated states
+(blocks of 2–4 states recover only part of the error). The errors include the factor
+√(G/(G-1)) for G resampled units. The other `bootstrap_*` functions take the same keywords.
 """
 function bootstrap_mbar_reweight(all_measurements, all_betas, beta_collapses,
                                  observable::Union{String, Symbol}; n_bootstrap::Int=500, max_inter_mbar::Int=1000,
-                                 mbar_tol::Float64=1e-8, verbose::Bool=true)
+                                 mbar_tol::Float64=1e-8, verbose::Bool=true, groups=nothing, block_length::Int=1)
     res = _bootstrap_mbar(mbar -> reweight_observable(mbar, observable),
                           all_measurements, all_betas, beta_collapses;
-                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose,
+                          groups=groups, block_length=block_length)
     verbose && _print_bootstrap_summary(res, beta_collapses, string(observable), n_bootstrap)
     return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
 end
 
 """
-    bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, observable; energy=:energy, n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+    bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses, observable; energy=:energy, n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true, groups=nothing, block_length=1)
 
 Bootstrapped `d⟨O⟩/dβ` (see `reweight_observable_dev`). The trajectory splines are fitted
 once, before resampling. Returns `(betas, d⟨O⟩/dβ, err, n_eff, free_energies, free_energy_err)`.
@@ -577,30 +662,32 @@ once, before resampling. Returns `(betas, d⟨O⟩/dβ, err, n_eff, free_energie
 function bootstrap_mbar_reweight_dev(all_measurements, all_betas, beta_collapses,
                                      observable::Union{String, Symbol}; energy::Union{String, Symbol}=:energy,
                                      n_bootstrap::Int=500, max_inter_mbar::Int=1000,
-                                     mbar_tol::Float64=1e-8, verbose::Bool=true)
+                                     mbar_tol::Float64=1e-8, verbose::Bool=true, groups=nothing, block_length::Int=1)
     meas = _with_derivatives(all_measurements, all_betas, [Symbol(observable), Symbol(energy)])
     res = _bootstrap_mbar(mbar -> reweight_observable_dev(mbar, observable; energy=energy),
                           meas, all_betas, beta_collapses;
-                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose,
+                          groups=groups, block_length=block_length)
     verbose && _print_bootstrap_summary(res, beta_collapses, "d$(observable)/dβ", n_bootstrap)
     return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
 end
 
 """
-    bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+    bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true, groups=nothing, block_length=1)
 
 Bootstrapped reduced free energies f(β) = ln Z(β₁) - ln Z(β) at every common beta
 (see `compute_mbar_free_energies`). Returns `(betas, f, f_err)`.
 """
 function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses;
                                      n_bootstrap::Int=500, max_inter_mbar::Int=1000,
-                                     mbar_tol::Float64=1e-8, verbose::Bool=true)
+                                     mbar_tol::Float64=1e-8, verbose::Bool=true, groups=nothing, block_length::Int=1)
     estimator = mbar -> begin
         betas, f = compute_mbar_free_energies(mbar)
         (betas, f, fill(NaN, length(betas)))
     end
     res = _bootstrap_mbar(estimator, all_measurements, all_betas, beta_collapses;
-                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose,
+                          groups=groups, block_length=block_length)
 
     if verbose
         println("\nMBAR Intermediate Free Energies (bootstrap n=$n_bootstrap):")
@@ -613,7 +700,7 @@ function bootstrap_all_free_energies(all_measurements, all_betas, beta_collapses
 end
 
 """
-    bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy, terms, linear_coefficients; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true)
+    bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy, terms, linear_coefficients; n_bootstrap=500, max_inter_mbar=1000, mbar_tol=1e-8, verbose=true, groups=nothing, block_length=1)
 
 Bootstrapped `(∂T/∂λ)_S` (see `compute_elastocaloric_effect`). The trajectory splines
 are fitted once, before resampling.
@@ -622,11 +709,12 @@ Returns `(betas, (∂T/∂λ)_S, err, n_eff, free_energies, free_energy_err)`.
 function bootstrap_mbar_magneto_caloric_effect(all_measurements, all_betas, beta_collapses, energy::Union{String, Symbol},
                                                plaquete_terms::AbstractVector{<:Union{String, Symbol}}, linear_coefficients::Vector{Float64};
                                                n_bootstrap::Int=500, max_inter_mbar::Int=1000,
-                                               mbar_tol::Float64=1e-8, verbose::Bool=true)
+                                               mbar_tol::Float64=1e-8, verbose::Bool=true, groups=nothing, block_length::Int=1)
     meas = _with_derivatives(all_measurements, all_betas, [Symbol(energy); Symbol.(plaquete_terms)])
     res = _bootstrap_mbar(mbar -> compute_elastocaloric_effect(mbar, energy, plaquete_terms, linear_coefficients),
                           meas, all_betas, beta_collapses;
-                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose)
+                          n_bootstrap=n_bootstrap, max_inter_mbar=max_inter_mbar, mbar_tol=mbar_tol, verbose=verbose,
+                          groups=groups, block_length=block_length)
     verbose && _print_bootstrap_summary(res, beta_collapses, "(∂T/∂λ)_S", n_bootstrap)
     return res.betas, res.values, res.values_err, res.n_eff, res.mbar.free_energies, res.free_energy_err
 end

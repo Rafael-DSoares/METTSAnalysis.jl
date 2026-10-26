@@ -43,7 +43,16 @@ Plain METTS averages from the thermalization chains are in `examples/metts_analy
   (`group_chains_single`) to combine them correctly and to be warned when they disagree.
   `error_method=:naive` and `:bootstrap` treat samples as independent and underestimate
   the error of a Markov chain.
-- MBAR errors come from bootstrapping the (independent) re-evolved product states.
+- MBAR errors come from bootstrapping the re-evolved product states within each
+  `beta_collapse`, re-solving MBAR for every replicate. This is correct for independent
+  states (checked against exact METTS samples). States thinned from short chains can still
+  be correlated, and their errors then come out too small. Pass `groups` (the chain/seed of
+  every sample, samples of a chain contiguous and in chain order) and `block_length > 1` to
+  any `bootstrap_*` function to resample runs of consecutive states together (block
+  bootstrap). On exact METTS samples, short blocks (2–4 states) recover only part of the
+  error; `block_length` at least the chain length (whole chains) stays correct, at the price
+  of noisier error bars when there are few chains. The errors include the small-sample
+  factor √(G/(G-1)) for G resampled units (11% for 5 seeds).
 - Free energies are reduced, `f(β) = ln Z(β₁) − ln Z(β)`: only differences are physical.
 
 ## Plotting
